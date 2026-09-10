@@ -352,6 +352,13 @@ async function applyTempRole(message: Message): Promise<void> {
     return;
   }
 
+  // The configured temp role is a requirement to use $temp.
+  // Do not give this role to users who do not already have it.
+  if (!message.member.roles.cache.has(tempRole.id)) {
+    await message.reply(`You need to have ${tempRole} to use \$temp.`);
+    return;
+  }
+
   const config = ticketConfigs.get(message.guild.id);
   const savedRoleIds = config?.tempRoleBackups?.[message.member.id];
 
@@ -437,10 +444,6 @@ async function applyTempRole(message: Message): Promise<void> {
         "Applied configured temp role",
       );
     }
-    if (!message.member.roles.cache.has(tempRole.id)) {
-      await message.member.roles.add(tempRole, "Applied configured temp role");
-    }
-
     await message.reply({
       embeds: [
         new EmbedBuilder()
