@@ -693,7 +693,7 @@ async function showRoleConfigModal(interaction: ButtonInteraction): Promise<void
   }
 
   const modal = new ModalBuilder()
-    .setCustomId(`ticket:role-modal:${mode}:${adminId}`)
+    .setCustomId(`ticket:roles:${mode}:${adminId}`)
     .setTitle(mode === "setup" ? "Ticket Setup" : "Ticket Config");
   const roleInput = new TextInputBuilder()
     .setCustomId("claim_roles")
@@ -712,67 +712,94 @@ async function showRoleConfigModal(interaction: ButtonInteraction): Promise<void
 async function saveRoleConfigFromModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
-  const [, , mode, adminId] = interaction.customId.split(":");
-  if (
-    !interaction.guild ||
-    !adminId ||
-    interaction.user.id !== adminId ||
-    !isAdministrator(interaction.member)
-  ) {
-    await interaction.reply({
-      content: "Only administrators can save ticket claim roles.",
-      ephemeral: true,
-    });
-    return;
-  }
+  try {
+    const [, , mode, adminId] = interaction.customId.split(":");
+    if (
+      !interaction.guild ||
+      !adminId ||
+      interaction.user.id !== adminId ||
+      !isAdministrator(interaction.member)
+    ) {
+      await interaction.reply({
+        content: "Only administrators can save ticket claim roles.",
+        ephemeral: true,
+      });
+      return;
+    }
 
-  const roleInput = interaction.fields.getTextInputValue("claim_roles");
-  const roleIds = parseRoleMentions(roleInput);
-  const validRoleIds = roleIds.filter(
-    (roleId) =>
-      roleId !== interaction.guild?.roles.everyone.id &&
-      interaction.guild?.roles.cache.has(roleId),
-  );
+    // Acknowledge immediately: fetching roles and syncing every open
+    // ticket's permissions can take longer than Discord's 3-second
+    // interaction window, so defer first and edit the reply once done.
+    await interaction.deferReply({ ephemeral: true });
 
-  if (roleIds.length === 0 || validRoleIds.length !== roleIds.length) {
-    await interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(BRAND_PURPLE)
-          .setTitle(`${BRAND_NAME} · Role Setup`)
-          .setDescription(
-            "Please mention one or more valid server roles, for example `<@&123456789012345678>`.",
-          ),
-      ],
-      ephemeral: true,
-    });
-    return;
-  }
+    const roleInput = interaction.fields.getTextInputValue("claim_roles");
+    const roleIds = parseRoleMentions(roleInput);
 
-  const config = await saveTicketConfig(interaction.guild.id, validRoleIds);
-  await syncOpenTicketPermissions(interaction.guild);
-  const roleMentions = config.claimRoleIds.map((roleId) => `<@&${roleId}>`).join(" ");
-  const successEmbed = new EmbedBuilder()
-    .setColor(BRAND_PURPLE)
-    .setTitle(`${BRAND_NAME} · ${mode === "setup" ? "Setup Complete" : "Config Updated"}`)
-    .setDescription(
-      [
-        `Allowed claim roles: ${roleMentions}`,
-        "",
-        mode === "setup"
-          ? "Your ticket panel is ready below."
-          : "New and unclaimed tickets will now use these roles.",
-      ].join("\n"),
+    if (roleIds.length === 0) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(BRAND_PURPLE)
+            .setTitle(`${BRAND_NAME} · Role Setup`)
+            .setDescription(
+              "Please mention one or more valid server roles, for example `<@&123456789012345678>`, or paste the plain role ID.",
+            ),
+        ],
+      });
+      return;
+    }
+
+    // Roles the bot hasn't seen recently may be missing from the cache,
+    // so fetch the full role list from Discord before validating instead
+    // of relying on the cache alone.
+    const guildRoles = await interaction.guild.roles.fetch();
+    const validRoleIds = roleIds.filter(
+      (roleId) => roleId !== interaction.guild?.roles.everyone.id && guildRoles.has(roleId),
     );
-  const channel = getModalTextChannel(interaction);
-  if (mode === "setup" && channel) {
-    await sendTicketPanel(channel);
+
+    if (validRoleIds.length !== roleIds.length) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(BRAND_PURPLE)
+            .setTitle(`${BRAND_NAME} · Role Setup`)
+            .setDescription(
+              "One or more of those roles could not be found in this server. Please double-check the role mention or ID and try again.",
+            ),
+        ],
+      });
+      return;
+    }
+
+    const config = await saveTicketConfig(interaction.guild.id, validRoleIds);
+    await syncOpenTicketPermissions(interaction.guild);
+    const roleMentions = config.claimRoleIds.map((roleId) => `<@&${roleId}>`).join(" ");
+    const successEmbed = new EmbedBuilder()
+      .setColor(BRAND_PURPLE)
+      .setTitle(`${BRAND_NAME} · ${mode === "setup" ? "Setup Complete" : "Config Updated"}`)
+      .setDescription(
+        [
+          `Allowed claim roles: ${roleMentions}`,
+          "",
+          mode === "setup"
+            ? "Your ticket panel is ready below."
+            : "New and unclaimed tickets will now use these roles.",
+        ].join("\n"),
+      );
+    const channel = getModalTextChannel(interaction);
+    if (mode === "setup" && channel) {
+      await sendTicketPanel(channel);
+    }
+    await interaction.editReply({ embeds: [successEmbed] });
+  } catch (error) {
+    await reportInteractionError(interaction, error, "Ticket role config save failed");
   }
-  await interaction.reply({ embeds: [successEmbed], ephemeral: true });
 }
 
 function parseRoleMentions(value: string): string[] {
-  return [...value.matchAll(/<@&(\d+)>/g)].map((match) => match[1]);
+  const mentionIds = [...value.matchAll(/<@&(\d+)>/g)].map((match) => match[1]);
+  const bareIds = [...value.matchAll(/\b(\d{15,25})\b/g)].map((match) => match[1]);
+  return [...new Set([...mentionIds, ...bareIds])];
 }
 
 async function syncOpenTicketPermissions(guild: Guild): Promise<void> {
