@@ -45,7 +45,7 @@ const TICKET_COMMAND_GUIDE = [
 ] as const;
 
 const TEMP_COMMAND_GUIDE = [
-  ["`$tempsetup @Role`", "set the one role members keep when using `$temp` (administrators only)"],
+  ["`$tempsetup @Role1 @Role2 ...`", "set the roles members must already have and keep when using `$temp` (administrators only)"],
   ["`$temp`", "toggle temp mode: keep only the configured role, then restore your roles when used again"],
 ] as const;
 
@@ -64,6 +64,7 @@ type TicketMetadata = {
 
 type TicketConfig = {
   claimRoleIds: string[];
+  tempRoleIds?: string[];
   tempRoleId?: string;
   tempRoleBackups?: Record<string, string[]>;
   updatedAt: string;
@@ -218,12 +219,12 @@ async function saveTicketConfig(
 
 async function saveTempRoleConfig(
   guildId: string,
-  tempRoleId: string,
+  tempRoleIds: string[],
 ): Promise<TicketConfig> {
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
     claimRoleIds: existingConfig?.claimRoleIds ?? [],
-    tempRoleId,
+    tempRoleIds,
     ...(existingConfig?.tempRoleBackups
       ? { tempRoleBackups: existingConfig.tempRoleBackups }
       : {}),
@@ -242,6 +243,7 @@ async function saveTempRoleBackup(
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
     claimRoleIds: existingConfig?.claimRoleIds ?? [],
+    ...(existingConfig?.tempRoleIds ? { tempRoleIds: existingConfig.tempRoleIds } : {}),
     ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
     tempRoleBackups: {
       ...(existingConfig?.tempRoleBackups ?? {}),
@@ -285,65 +287,66 @@ async function persistTicketConfigs(): Promise<void> {
 
 async function configureTempRole(message: Message): Promise<void> {
   if (!message.member || !isAdministrator(message.member)) {
-    await message.reply("Only server administrators can configure the temp role.");
+    await message.reply("Only server administrators can configure the temp roles.");
     return;
   }
 
-  if (message.mentions.roles.size !== 1) {
-    await message.reply("Use `$tempsetup @Role` and mention exactly one role to keep.");
+  if (message.mentions.roles.size < 1) {
+    await message.reply("Use `$tempsetup @Role1 @Role2 ...` and mention at least one role to keep.");
     return;
   }
 
-  const role = message.mentions.roles.first();
+  const roles = [...message.mentions.roles.values()];
   const botMember = message.guild?.members.me;
-  if (!message.guild || !role || !botMember) {
-    await message.reply("I could not verify that role in this server. Please try again.");
+  if (!message.guild || !botMember) {
+    await message.reply("I could not verify those roles in this server. Please try again.");
     return;
   }
 
-  if (role.id === message.guild.roles.everyone.id || role.managed) {
-    await message.reply("Choose a regular server role, not @everyone or a managed integration role.");
-    return;
+  for (const role of roles) {
+    if (role.id === message.guild.roles.everyone.id || role.managed) {
+      await message.reply("Choose regular server roles, not @everyone or managed integration roles.");
+      return;
+    }
+    if (!role.editable || role.position >= botMember.roles.highest.position) {
+      await message.reply(`I cannot manage ${role}. Move the bot's highest role above it, then run $tempsetup again.`);
+      return;
+    }
   }
 
-  if (!role.editable || role.position >= botMember.roles.highest.position) {
-    await message.reply(
-      "I cannot manage that role. Move the bot's highest role above it, then run `$tempsetup @Role` again.",
-    );
-    return;
-  }
-
-  await saveTempRoleConfig(message.guild.id, role.id);
+  await saveTempRoleConfig(message.guild.id, roles.map((role) => role.id));
   await message.reply({
     embeds: [
       new EmbedBuilder()
         .setColor(BRAND_PURPLE)
-        .setTitle(`${BRAND_NAME} · Temp Role Updated`)
-        .setDescription(
-          `Members who use \`$temp\` will keep ${role} and have their other removable roles removed.`,
-        )
-        .setFooter({ text: "Use $temp to apply this setting to yourself." }),
+        .setTitle(`${BRAND_NAME} · Temp Roles Updated`)
+        .setDescription(`Members who use \`$temp\` must already have all of these roles and will keep them while their other removable roles are removed: ${roles.join(" ")}.`)
+        .setFooter({ text: "Run $tempsetup again anytime to replace the configured roles." }),
     ],
   });
 }
 
 async function applyTempRole(message: Message): Promise<void> {
-  if (!message.member || !message.guild) {
+  if (!message.member || !message.guild) return;
+
+  const config = ticketConfigs.get(message.guild.id);
+  const configuredTempRoleIds = config?.tempRoleIds?.length
+    ? config.tempRoleIds
+    : config?.tempRoleId
+      ? [config.tempRoleId]
+      : [];
+
+  if (configuredTempRoleIds.length === 0) {
+    await message.reply("An administrator must run `$tempsetup @Role1 @Role2 ...` before `$temp` can be used.");
     return;
   }
 
-  const tempRoleId = ticketConfigs.get(message.guild.id)?.tempRoleId;
-  if (!tempRoleId) {
-    await message.reply("An administrator must run `$tempsetup @Role` before `$temp` can be used.");
-    return;
-  }
-
-  const tempRole = message.guild.roles.cache.get(tempRoleId);
+  const tempRoles = configuredTempRoleIds
+    .map((roleId) => message.guild!.roles.cache.get(roleId))
+    .filter((role): role is NonNullable<typeof role> => Boolean(role));
   const botMember = message.guild.members.me;
-  if (!tempRole || !botMember || tempRole.managed || !tempRole.editable) {
-    await message.reply(
-      "The configured temp role is no longer available to manage. Ask an administrator to run `$tempsetup @Role` again.",
-    );
+  if (tempRoles.length !== configuredTempRoleIds.length || !botMember || tempRoles.some((role) => role.managed || !role.editable)) {
+    await message.reply("One or more configured temp roles are no longer available to manage. Ask an administrator to run `$tempsetup` again.");
     return;
   }
 
@@ -352,50 +355,28 @@ async function applyTempRole(message: Message): Promise<void> {
     return;
   }
 
-  // The configured temp role is a requirement to use $temp.
-  // Do not give this role to users who do not already have it.
-  if (!message.member.roles.cache.has(tempRole.id)) {
-    await message.reply(`You need to have ${tempRole} to use \$temp.`);
+  if (tempRoles.some((role) => !message.member!.roles.cache.has(role.id))) {
+    await message.reply(`You need to have all configured temp roles (${tempRoles.join(" ")}) to use $temp.`);
     return;
   }
 
-  const config = ticketConfigs.get(message.guild.id);
   const savedRoleIds = config?.tempRoleBackups?.[message.member.id];
+  const tempRoleIdSet = new Set(configuredTempRoleIds);
 
   try {
     if (savedRoleIds !== undefined) {
       const rolesToRestore = savedRoleIds.filter((roleId) => {
-        const role = message.guild?.roles.cache.get(roleId);
-        return Boolean(
-          role &&
-            role.id !== message.guild?.roles.everyone.id &&
-            !role.managed &&
-            role.editable,
-        );
+        const role = message.guild!.roles.cache.get(roleId);
+        return Boolean(role && role.id !== message.guild!.roles.everyone.id && !role.managed && role.editable && !tempRoleIdSet.has(role.id));
       });
       const rolesToRestoreSet = new Set(rolesToRestore);
       const rolesToRemove = message.member.roles.cache
-        .filter(
-          (role) =>
-            role.id !== message.guild?.roles.everyone.id &&
-            !role.managed &&
-            role.editable &&
-            !rolesToRestoreSet.has(role.id),
-        )
+        .filter((role) => role.id !== message.guild!.roles.everyone.id && !role.managed && role.editable && !tempRoleIdSet.has(role.id) && !rolesToRestoreSet.has(role.id))
         .map((role) => role.id);
 
-      if (rolesToRemove.length > 0) {
-        await message.member.roles.remove(
-          rolesToRemove,
-          "Restored roles from temp mode",
-        );
-      }
-      if (rolesToRestore.length > 0) {
-        await message.member.roles.add(
-          rolesToRestore,
-          "Restored roles from temp mode",
-        );
-      }
+      if (rolesToRemove.length > 0) await message.member.roles.remove(rolesToRemove, "Restored roles from temp mode");
+      if (rolesToRestore.length > 0) await message.member.roles.add(rolesToRestore, "Restored roles from temp mode");
+      await message.member.roles.remove(tempRoles.map((role) => role.id), "Removed configured temp roles after temp mode");
       await clearTempRoleBackup(message.guild.id, message.member.id);
 
       const missingRoleCount = savedRoleIds.length - rolesToRestore.length;
@@ -404,67 +385,33 @@ async function applyTempRole(message: Message): Promise<void> {
           new EmbedBuilder()
             .setColor(BRAND_PURPLE)
             .setTitle(`${BRAND_NAME} · Temp Mode Removed`)
-            .setDescription(
-              `Your saved roles have been restored and ${tempRole} was removed.`,
-            )
-            .setFooter({
-              text:
-                missingRoleCount > 0
-                  ? `${missingRoleCount} saved role(s) no longer exist or could not be managed.`
-                  : "Use $temp again to apply temp mode.",
-            }),
+            .setDescription("Your saved roles have been restored and the configured temp roles were removed.")
+            .setFooter({ text: missingRoleCount > 0 ? `${missingRoleCount} saved role(s) no longer exist or could not be managed.` : "Use $temp again to apply temp mode." }),
         ],
       });
       return;
     }
 
     const removableRoleIds = message.member.roles.cache
-      .filter(
-        (role) =>
-          role.id !== tempRole.id &&
-          !role.managed &&
-          role.editable,
-      )
+      .filter((role) => !tempRoleIdSet.has(role.id) && !role.managed && role.editable)
       .map((role) => role.id);
-    const skippedRoleCount = message.member.roles.cache.filter(
-      (role) =>
-        role.id !== tempRole.id &&
-        role.id !== message.guild?.roles.everyone.id &&
-        (role.managed || !role.editable),
-    ).size;
+    const skippedRoleCount = message.member.roles.cache.filter((role) => !tempRoleIdSet.has(role.id) && role.id !== message.guild!.roles.everyone.id && (role.managed || !role.editable)).size;
 
-    await saveTempRoleBackup(
-      message.guild.id,
-      message.member.id,
-      removableRoleIds,
-    );
-    if (removableRoleIds.length > 0) {
-      await message.member.roles.remove(
-        removableRoleIds,
-        "Applied configured temp role",
-      );
-    }
+    await saveTempRoleBackup(message.guild.id, message.member.id, removableRoleIds);
+    if (removableRoleIds.length > 0) await message.member.roles.remove(removableRoleIds, "Applied configured temp roles");
+
     await message.reply({
       embeds: [
         new EmbedBuilder()
           .setColor(BRAND_PURPLE)
           .setTitle(`${BRAND_NAME} · Temp Mode Applied`)
-          .setDescription(
-            `You now have ${tempRole} as your configured visible role.`,
-          )
-          .setFooter({
-            text:
-              skippedRoleCount > 0
-                ? `${skippedRoleCount} Discord-managed or higher roles could not be changed.`
-                : "Use $temp again to restore your previous roles.",
-          }),
+          .setDescription(`Your configured temp roles are being kept: ${tempRoles.join(" ")}.`)
+          .setFooter({ text: skippedRoleCount > 0 ? `${skippedRoleCount} Discord-managed or higher roles could not be changed.` : "Use $temp again to restore your previous roles." }),
       ],
     });
   } catch (error) {
     logger.error({ err: error, guildId: message.guild.id, userId: message.author.id }, "Temp role application failed");
-    await message.reply(
-      "I could not update all of your roles. Make sure my highest role is above the roles you want me to remove.",
-    );
+    await message.reply("I could not update all of your roles. Make sure my highest role is above the roles you want me to remove.");
   }
 }
 
@@ -475,6 +422,10 @@ function isValidTicketConfig(config: unknown): config is TicketConfig {
       "claimRoleIds" in config &&
       Array.isArray(config.claimRoleIds) &&
       config.claimRoleIds.every((roleId) => typeof roleId === "string") &&
+      (!("tempRoleIds" in config) ||
+        config.tempRoleIds === undefined ||
+        (Array.isArray(config.tempRoleIds) &&
+          config.tempRoleIds.every((roleId) => typeof roleId === "string"))) &&
       (!("tempRoleId" in config) ||
         config.tempRoleId === undefined ||
         typeof config.tempRoleId === "string"),
