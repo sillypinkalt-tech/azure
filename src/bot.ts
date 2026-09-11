@@ -1404,6 +1404,14 @@ async function transferTicket(
   await message.react("✅");
 }
 
+// Ticket state is persisted in the channel topic, which shares Discord's
+// strict rate limit for channel name/topic edits (2 per 10 minutes per
+// channel). Claim/unclaim/transfer already spend that budget, so closing
+// must NOT also rewrite the topic or rename the channel — either one can
+// get rate-limited and silently stall for minutes. Guard against a double
+// close with this in-memory set instead.
+const closingTicketChannelIds = new Set<string>();
+
 async function closeTicket(
   actor: Message | ButtonInteraction,
   channel: TextChannel,
@@ -1414,22 +1422,21 @@ async function closeTicket(
     return;
   }
 
-  if (ticket.state === "closed") {
+  if (ticket.state === "closed" || closingTicketChannelIds.has(channel.id)) {
     await replyToActor(actor, "This ticket is already closing or closed.");
     return;
   }
+  closingTicketChannelIds.add(channel.id);
 
-  // Mark closed immediately so a second $close/$ticketclose fired while this
-  // one is still running gets caught by the check above instead of racing it.
   const nextTicket = { ...ticket, state: "closed" as const };
-  await updateTicket(channel, nextTicket);
 
   await channel.send(`🔒 Ticket is being closed by <@${getActorId(actor)}>...`);
 
+  // permissionOverwrites uses a separate, much more generous rate limit
+  // bucket than name/topic edits, so this is safe to do immediately.
   await channel.permissionOverwrites.set(
     buildClosedTicketOverwrites(channel.guild, nextTicket),
   );
-  await channel.setName(`closed-${channel.name.replace(/^ticket-/, "").slice(0, 70)}`);
 
   let logChannel: TextChannel | null = null;
   try {
