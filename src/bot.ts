@@ -5,6 +5,7 @@ import {
   AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelSelectMenuBuilder,
   ChannelType,
   Client,
   EmbedBuilder,
@@ -18,6 +19,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   type ButtonInteraction,
+  type ChannelSelectMenuInteraction,
   type Guild,
   type Message,
   type ModalSubmitInteraction,
@@ -37,7 +39,8 @@ const TICKET_COMMAND_GUIDE = [
   ["`$claim`", "claim the current ticket (configured staff roles or administrators)"],
   ["`$unclaim`", "release the current ticket (configured staff roles or administrators)"],
   ["`$transfer @user`", "transfer the ticket to another configured staff member"],
-  ["`$add @user`", "add someone to the current ticket"],
+  ["`$add @user`", "add someone to the current ticket (claim roles, admins, or the ticket owner)"],
+  ["`$remove @user`", "remove a previously added member from the current ticket"],
   ["`$ticketclose`", "close and lock the current ticket (configured staff roles or administrators)"],
   ["`$tickettranscript`", "save and log the ticket conversation (configured staff roles or administrators)"],
   ["`$ticketconfig`", "change the roles that can claim tickets (administrators only)"],
@@ -47,6 +50,10 @@ const TICKET_COMMAND_GUIDE = [
 const TEMP_COMMAND_GUIDE = [
   ["`$tempsetup @Role1 @Role2 ...`", "set the roles members must already have and keep when using `$temp` (administrators only)"],
   ["`$temp`", "toggle temp mode: keep only the configured role, then restore your roles when used again"],
+] as const;
+
+const ADMIN_COMMAND_GUIDE = [
+  ["`$say`", "compose and send a message (plain or embed) as the bot in the current channel (administrators only)"],
 ] as const;
 
 type TicketState = "open" | "claimed" | "closed";
@@ -64,6 +71,7 @@ type TicketMetadata = {
 
 type TicketConfig = {
   claimRoleIds: string[];
+  transcriptChannelId?: string;
   tempRoleIds?: string[];
   tempRoleId?: string;
   tempRoleBackups?: Record<string, string[]>;
@@ -97,6 +105,8 @@ const status: DiscordBotStatus = {
 let client: Client | null = null;
 let startPromise: Promise<void> | null = null;
 const ticketConfigs = new Map<string, TicketConfig>();
+type SayDraft = { channelId: string; content: string; title: string | null };
+const sayDrafts = new Map<string, SayDraft>();
 
 export function getDiscordBotStatus(): DiscordBotStatus {
   return {
@@ -158,6 +168,11 @@ async function connectDiscordBot(): Promise<void> {
 
     if (interaction.isModalSubmit()) {
       void handleTicketModal(interaction);
+      return;
+    }
+
+    if (interaction.isChannelSelectMenu()) {
+      void handleTranscriptChannelSelect(interaction);
     }
   });
 
@@ -206,6 +221,29 @@ async function saveTicketConfig(
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
     claimRoleIds: [...new Set(claimRoleIds)],
+    ...(existingConfig?.transcriptChannelId
+      ? { transcriptChannelId: existingConfig.transcriptChannelId }
+      : {}),
+    ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
+    ...(existingConfig?.tempRoleBackups
+      ? { tempRoleBackups: existingConfig.tempRoleBackups }
+      : {}),
+    updatedAt: new Date().toISOString(),
+  };
+  ticketConfigs.set(guildId, config);
+  await persistTicketConfigs();
+  return config;
+}
+
+async function saveTranscriptChannelConfig(
+  guildId: string,
+  transcriptChannelId: string,
+): Promise<TicketConfig> {
+  const existingConfig = ticketConfigs.get(guildId);
+  const config: TicketConfig = {
+    claimRoleIds: existingConfig?.claimRoleIds ?? [],
+    transcriptChannelId,
+    ...(existingConfig?.tempRoleIds ? { tempRoleIds: existingConfig.tempRoleIds } : {}),
     ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
     ...(existingConfig?.tempRoleBackups
       ? { tempRoleBackups: existingConfig.tempRoleBackups }
@@ -243,6 +281,9 @@ async function saveTempRoleBackup(
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
     claimRoleIds: existingConfig?.claimRoleIds ?? [],
+    ...(existingConfig?.transcriptChannelId
+      ? { transcriptChannelId: existingConfig.transcriptChannelId }
+      : {}),
     ...(existingConfig?.tempRoleIds ? { tempRoleIds: existingConfig.tempRoleIds } : {}),
     ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
     tempRoleBackups: {
@@ -427,6 +468,9 @@ function isValidTicketConfig(config: unknown): config is TicketConfig {
       "claimRoleIds" in config &&
       Array.isArray(config.claimRoleIds) &&
       config.claimRoleIds.every((roleId) => typeof roleId === "string") &&
+      (!("transcriptChannelId" in config) ||
+        config.transcriptChannelId === undefined ||
+        typeof config.transcriptChannelId === "string") &&
       (!("tempRoleIds" in config) ||
         config.tempRoleIds === undefined ||
         (Array.isArray(config.tempRoleIds) &&
@@ -513,6 +557,11 @@ async function handlePrefixCommand(message: Message): Promise<void> {
     return;
   }
 
+  if (command === "say") {
+    await startSayCommand(message);
+    return;
+  }
+
   const ticketContext = getTicketContext(message);
   if (!ticketContext) {
     return;
@@ -544,6 +593,13 @@ async function handlePrefixCommand(message: Message): Promise<void> {
       return;
     case "add":
       await addTicketMember(
+        message,
+        ticketContext.channel,
+        ticketContext.ticket,
+      );
+      return;
+    case "remove":
+      await removeTicketMember(
         message,
         ticketContext.channel,
         ticketContext.ticket,
@@ -734,6 +790,7 @@ async function saveRoleConfigFromModal(
     const config = await saveTicketConfig(interaction.guild.id, validRoleIds);
     await syncOpenTicketPermissions(interaction.guild);
     const roleMentions = config.claimRoleIds.map((roleId) => `<@&${roleId}>`).join(" ");
+    const needsTranscriptChannel = !config.transcriptChannelId;
     const successEmbed = new EmbedBuilder()
       .setColor(BRAND_PURPLE)
       .setTitle(`${BRAND_NAME} · ${mode === "setup" ? "Setup Complete" : "Config Updated"}`)
@@ -741,18 +798,260 @@ async function saveRoleConfigFromModal(
         [
           `Allowed claim roles: ${roleMentions}`,
           "",
-          mode === "setup"
-            ? "Your ticket panel is ready below."
-            : "New and unclaimed tickets will now use these roles.",
+          needsTranscriptChannel
+            ? "One more step: pick a channel below to log ticket transcripts."
+            : mode === "setup"
+              ? "Your ticket panel is ready below."
+              : "New and unclaimed tickets will now use these roles.",
         ].join("\n"),
       );
     const channel = getModalTextChannel(interaction);
+
+    if (needsTranscriptChannel) {
+      const selectRow = new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId(`ticket:transcript-channel:${mode}:${adminId}`)
+          .setPlaceholder("Select a channel for ticket transcripts")
+          .addChannelTypes(ChannelType.GuildText)
+          .setMinValues(1)
+          .setMaxValues(1),
+      );
+      await interaction.editReply({ embeds: [successEmbed], components: [selectRow] });
+      return;
+    }
+
     if (mode === "setup" && channel) {
       await sendTicketPanel(channel);
     }
-    await interaction.editReply({ embeds: [successEmbed] });
+    await interaction.editReply({ embeds: [successEmbed], components: [] });
   } catch (error) {
     await reportInteractionError(interaction, error, "Ticket role config save failed");
+  }
+}
+
+async function handleTranscriptChannelSelect(
+  interaction: ChannelSelectMenuInteraction,
+): Promise<void> {
+  if (!interaction.customId.startsWith("ticket:transcript-channel:")) {
+    return;
+  }
+
+  try {
+    const [, , mode, adminId] = interaction.customId.split(":");
+    if (
+      !interaction.guild ||
+      !adminId ||
+      interaction.user.id !== adminId ||
+      !isAdministrator(interaction.member)
+    ) {
+      await interaction.reply({
+        content: "Only the administrator who started this setup can pick the transcript channel.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferUpdate();
+
+    const selectedChannelId = interaction.values[0];
+    await saveTranscriptChannelConfig(interaction.guild.id, selectedChannelId);
+
+    const confirmEmbed = new EmbedBuilder()
+      .setColor(BRAND_PURPLE)
+      .setTitle(`${BRAND_NAME} · Transcript Channel Set`)
+      .setDescription(
+        [
+          `Ticket transcripts will be logged to <#${selectedChannelId}>.`,
+          "",
+          mode === "setup" ? "Your ticket panel is ready below." : "Setup complete.",
+        ].join("\n"),
+      );
+    await interaction.editReply({ embeds: [confirmEmbed], components: [] });
+
+    if (mode === "setup") {
+      const panelChannel = interaction.channel;
+      if (panelChannel && isTextChannel(panelChannel)) {
+        await sendTicketPanel(panelChannel);
+      }
+    }
+  } catch (error) {
+    logger.error({ err: error }, "Transcript channel selection failed");
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ content: "I couldn't save that channel.", ephemeral: true });
+    } else {
+      await interaction.reply({ content: "I couldn't save that channel.", ephemeral: true });
+    }
+  }
+}
+
+async function startSayCommand(message: Message): Promise<void> {
+  if (!message.member || !isAdministrator(message.member)) {
+    await message.reply("Only server administrators can use `$say`.");
+    return;
+  }
+
+  if (!isTextChannel(message.channel)) {
+    await message.reply("This command can only be used in a server text channel.");
+    return;
+  }
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`say:open:${message.author.id}:${message.channel.id}`)
+      .setLabel("Write Message")
+      .setStyle(ButtonStyle.Primary),
+  );
+  await message.reply({
+    content: "Click below to write the message you want to send in this channel.",
+    components: [row],
+  });
+}
+
+async function openSayModal(interaction: ButtonInteraction): Promise<void> {
+  const [, , authorId, channelId] = interaction.customId.split(":");
+  if (
+    !authorId ||
+    !channelId ||
+    interaction.user.id !== authorId ||
+    !isAdministrator(interaction.member)
+  ) {
+    await interaction.reply({
+      content: "Only the administrator who ran `$say` can write this message.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`say:modal:${authorId}:${channelId}`)
+    .setTitle("Say Something");
+
+  const contentInput = new TextInputBuilder()
+    .setCustomId("content")
+    .setLabel("Message")
+    .setPlaceholder("Write anything — supports **bold**, # headings, mentions, etc.")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(4000);
+
+  const titleInput = new TextInputBuilder()
+    .setCustomId("embed_title")
+    .setLabel("Embed title (optional, only used if you pick Embed)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(256);
+
+  modal.addComponents(
+    new ActionRowBuilder<TextInputBuilder>().addComponents(contentInput),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(titleInput),
+  );
+  await interaction.showModal(modal);
+}
+
+async function saveSayDraftFromModal(interaction: ModalSubmitInteraction): Promise<void> {
+  try {
+    const [, , authorId, channelId] = interaction.customId.split(":");
+    if (
+      !authorId ||
+      !channelId ||
+      interaction.user.id !== authorId ||
+      !isAdministrator(interaction.member)
+    ) {
+      await interaction.reply({
+        content: "Only the administrator who ran `$say` can write this message.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const content = interaction.fields.getTextInputValue("content");
+    const titleRaw = interaction.fields.getTextInputValue("embed_title");
+    sayDrafts.set(authorId, { channelId, content, title: titleRaw.trim() || null });
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`say:send:embed:${authorId}`)
+        .setLabel("Send as Embed")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`say:send:plain:${authorId}`)
+        .setLabel("Send as Plain Text")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`say:cancel:${authorId}`)
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary),
+    );
+
+    await interaction.reply({
+      content: "Choose how to send this message:",
+      components: [row],
+      ephemeral: true,
+    });
+  } catch (error) {
+    await reportInteractionError(interaction, error, "Say draft save failed");
+  }
+}
+
+async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
+  if (interaction.customId.startsWith("say:open:")) {
+    await openSayModal(interaction);
+    return;
+  }
+
+  if (interaction.customId.startsWith("say:cancel:")) {
+    const [, , authorId] = interaction.customId.split(":");
+    if (interaction.user.id !== authorId) {
+      await interaction.reply({ content: "This isn't your draft to cancel.", ephemeral: true });
+      return;
+    }
+    sayDrafts.delete(authorId);
+    await interaction.update({ content: "Cancelled. Nothing was sent.", components: [] });
+    return;
+  }
+
+  if (interaction.customId.startsWith("say:send:")) {
+    const [, , style, authorId] = interaction.customId.split(":");
+    if (interaction.user.id !== authorId || !isAdministrator(interaction.member)) {
+      await interaction.reply({ content: "This isn't your draft to send.", ephemeral: true });
+      return;
+    }
+
+    const draft = sayDrafts.get(authorId);
+    if (!draft) {
+      await interaction.update({
+        content: "This draft has expired. Run `$say` again.",
+        components: [],
+      });
+      return;
+    }
+
+    try {
+      const targetChannel = await interaction.guild?.channels.fetch(draft.channelId);
+      if (!targetChannel || !isTextChannel(targetChannel)) {
+        await interaction.update({
+          content: "I couldn't find the channel this message was meant for.",
+          components: [],
+        });
+        return;
+      }
+
+      if (style === "embed") {
+        const embed = new EmbedBuilder().setColor(BRAND_PURPLE).setDescription(draft.content);
+        if (draft.title) {
+          embed.setTitle(draft.title);
+        }
+        await targetChannel.send({ embeds: [embed] });
+      } else {
+        await targetChannel.send({ content: draft.content });
+      }
+
+      sayDrafts.delete(authorId);
+      await interaction.update({ content: `Message sent to ${targetChannel}.`, components: [] });
+    } catch (error) {
+      logger.error({ err: error }, "Say send failed");
+      await interaction.update({ content: "I couldn't send that message.", components: [] });
+    }
   }
 }
 
@@ -814,6 +1113,11 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
     return;
   }
 
+  if (interaction.customId.startsWith("say:")) {
+    await handleSayButton(interaction);
+    return;
+  }
+
   const channel = getInteractionTextChannel(interaction);
   const ticket = channel ? decodeTicketTopic(channel.topic) : null;
   if (!channel || !ticket) {
@@ -857,6 +1161,11 @@ async function handleTicketModal(
 ): Promise<void> {
   if (interaction.customId.startsWith("ticket:roles:")) {
     await saveRoleConfigFromModal(interaction);
+    return;
+  }
+
+  if (interaction.customId.startsWith("say:modal:")) {
+    await saveSayDraftFromModal(interaction);
     return;
   }
 
@@ -1082,23 +1391,34 @@ async function closeTicket(
     buildClosedTicketOverwrites(channel.guild, nextTicket),
   );
   await channel.setName(`closed-${channel.name.replace(/^ticket-/, "").slice(0, 70)}`);
-  await channel.send(`Ticket closed by <@${getActorId(actor)}>. Use \`$tickettranscript\` to save the conversation.`);
-  await replyToActor(actor, "The ticket has been closed and locked.");
-}
 
-async function createTicketTranscript(
-  actor: Message | ButtonInteraction,
-  channel: TextChannel,
-  ticket: TicketMetadata,
-): Promise<void> {
-  if (!canClaimTicket(actor)) {
-    await replyToActor(
-      actor,
-      "Only an administrator or a member with an allowed claim role can create transcripts.",
-    );
-    return;
+  let logChannel: TextChannel | null = null;
+  try {
+    logChannel = await saveTicketTranscript(channel, nextTicket);
+  } catch (error) {
+    logger.error({ err: error, channelId: channel.id }, "Automatic transcript save on close failed");
   }
 
+  await channel.send(
+    [
+      `Ticket closed by <@${getActorId(actor)}>.`,
+      logChannel ? `Transcript saved to ${logChannel}.` : "Transcript could not be saved automatically.",
+      "This channel will be deleted in 30 seconds.",
+    ].join(" "),
+  );
+  await replyToActor(actor, "The ticket has been closed. It will be deleted in 30 seconds.");
+
+  setTimeout(() => {
+    void channel.delete("Ticket closed - automatic cleanup").catch((error) => {
+      logger.error({ err: error, channelId: channel.id }, "Failed to auto-delete closed ticket channel");
+    });
+  }, 30_000);
+}
+
+async function saveTicketTranscript(
+  channel: TextChannel,
+  ticket: TicketMetadata,
+): Promise<TextChannel | null> {
   const fetchedMessages = await channel.messages.fetch({ limit: 100 });
   const transcript = [...fetchedMessages.values()]
     .sort((first, second) => first.createdTimestamp - second.createdTimestamp)
@@ -1126,6 +1446,23 @@ async function createTicketTranscript(
     content: `Transcript for **${channel.name}** · opened by <@${ticket.ownerId}>${ticket.claimerId ? ` · handled by <@${ticket.claimerId}>` : ""}`,
     files: [attachment],
   });
+  return logChannel;
+}
+
+async function createTicketTranscript(
+  actor: Message | ButtonInteraction,
+  channel: TextChannel,
+  ticket: TicketMetadata,
+): Promise<void> {
+  if (!canClaimTicket(actor)) {
+    await replyToActor(
+      actor,
+      "Only an administrator or a member with an allowed claim role can create transcripts.",
+    );
+    return;
+  }
+
+  const logChannel = await saveTicketTranscript(channel, ticket);
   await replyToActor(actor, `Transcript saved${logChannel ? ` to ${logChannel}` : " in this ticket"}.`);
 }
 
@@ -1134,8 +1471,8 @@ async function addTicketMember(
   channel: TextChannel,
   ticket: TicketMetadata,
 ): Promise<void> {
-  if (!isStaff(message.member) && message.author.id !== ticket.ownerId) {
-    await message.reply("Only the ticket owner, staff, or an administrator can add members.");
+  if (!canClaimTicket(message) && message.author.id !== ticket.ownerId) {
+    await message.reply("Only the ticket owner, a member with an allowed claim role, or an administrator can add members.");
     return;
   }
 
@@ -1159,16 +1496,60 @@ async function addTicketMember(
     additionalMemberIds: [...(ticket.additionalMemberIds ?? []), member.id],
   };
   await updateTicket(channel, nextTicket);
-
-  const overwrites =
-    nextTicket.state === "closed"
-      ? buildClosedTicketOverwrites(channel.guild, nextTicket)
-      : nextTicket.state === "claimed"
-        ? buildClaimedTicketOverwrites(channel.guild, nextTicket)
-        : buildUnclaimedTicketOverwrites(channel.guild, nextTicket);
-  await channel.permissionOverwrites.set(overwrites);
+  await channel.permissionOverwrites.set(buildOverwritesForState(channel.guild, nextTicket));
 
   await message.reply(`<@${member.id}> was added to the ticket.`);
+}
+
+async function removeTicketMember(
+  message: Message,
+  channel: TextChannel,
+  ticket: TicketMetadata,
+): Promise<void> {
+  if (!canClaimTicket(message) && message.author.id !== ticket.ownerId) {
+    await message.reply("Only the ticket owner, a member with an allowed claim role, or an administrator can remove members.");
+    return;
+  }
+
+  const member = message.mentions.members?.first();
+  if (!member) {
+    await message.reply("Use `$remove @user` to remove someone from this ticket.");
+    return;
+  }
+
+  if (member.id === ticket.ownerId) {
+    await message.reply("The ticket owner cannot be removed from their own ticket.");
+    return;
+  }
+
+  if (member.id === ticket.claimerId) {
+    await message.reply("The current claimer cannot be removed. Use `$unclaim` or `$transfer` first.");
+    return;
+  }
+
+  if (!ticket.additionalMemberIds?.includes(member.id)) {
+    await message.reply(`<@${member.id}> was not added to this ticket.`);
+    return;
+  }
+
+  const nextTicket: TicketMetadata = {
+    ...ticket,
+    additionalMemberIds: ticket.additionalMemberIds.filter((id) => id !== member.id),
+  };
+  await updateTicket(channel, nextTicket);
+  await channel.permissionOverwrites.set(buildOverwritesForState(channel.guild, nextTicket));
+
+  await message.reply(`<@${member.id}> was removed from the ticket.`);
+}
+
+function buildOverwritesForState(guild: Guild, ticket: TicketMetadata): OverwriteResolvable[] {
+  if (ticket.state === "closed") {
+    return buildClosedTicketOverwrites(guild, ticket);
+  }
+  if (ticket.state === "claimed") {
+    return buildClaimedTicketOverwrites(guild, ticket);
+  }
+  return buildUnclaimedTicketOverwrites(guild, ticket);
 }
 
 async function sendTicketHelp(message: Message): Promise<void> {
@@ -1186,6 +1567,7 @@ function commandListText(): string {
     "`$cmd` — show this full command guide",
     ...TICKET_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
     ...TEMP_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
+    ...ADMIN_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
   ].join("\n");
 }
 
@@ -1220,6 +1602,8 @@ function ticketHelpEmbed(): EmbedBuilder {
           "`$claim` — claim the current ticket",
           "`$unclaim` — release the current ticket",
           "`$transfer @user` — transfer it to another configured staff member",
+          "`$add @user` — add someone to the ticket",
+          "`$remove @user` — remove a previously added member",
           "`$ticketclose` — close and lock the ticket",
           "`$tickettranscript` — save and log the conversation",
         ].join("\n"),
@@ -1611,7 +1995,8 @@ async function reportInteractionError(
 async function getTranscriptLogChannel(
   guild: Guild,
 ): Promise<TextChannel | null> {
-  const channelId = process.env.DISCORD_TRANSCRIPT_CHANNEL_ID;
+  const channelId =
+    ticketConfigs.get(guild.id)?.transcriptChannelId ?? process.env.DISCORD_TRANSCRIPT_CHANNEL_ID;
   if (!channelId) {
     return null;
   }
