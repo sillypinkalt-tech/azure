@@ -41,7 +41,7 @@ const TICKET_COMMAND_GUIDE = [
   ["`$transfer @user`", "transfer the ticket to another configured staff member"],
   ["`$add @user`", "add someone to the current ticket (claim roles, admins, or the ticket owner)"],
   ["`$remove @user`", "remove a previously added member from the current ticket"],
-  ["`$close` / `$ticketclose`", "close the current ticket, save its transcript, and delete it 30 seconds later (configured staff roles or administrators)"],
+  ["`$close` / `$ticketclose`", "close the current ticket, save its transcript, and delete it immediately (configured staff roles or administrators)"],
   ["`$tickettranscript`", "save and log the ticket conversation (configured staff roles or administrators)"],
   ["`$ticketconfig`", "change the roles that can claim tickets (administrators only)"],
   ["`$tickethelp`", "show ticket commands only"],
@@ -1419,39 +1419,31 @@ async function closeTicket(
     return;
   }
 
-  // Mark the ticket closed right away so a second $close/$ticketclose during
-  // the 30s window is caught by the check above instead of scheduling a
-  // second close. The actual lock/rename/transcript/delete all happen
-  // together once the timer finishes.
+  // Mark closed immediately so a second $close/$ticketclose fired while this
+  // one is still running gets caught by the check above instead of racing it.
   const nextTicket = { ...ticket, state: "closed" as const };
   await updateTicket(channel, nextTicket);
 
-  await channel.send(
-    `Ticket closing initiated by <@${getActorId(actor)}>. This ticket will be closed and deleted in 30 seconds.`,
-  );
-  await replyToActor(actor, "The ticket will be closed and deleted in 30 seconds.");
+  await channel.send(`🔒 Ticket is being closed by <@${getActorId(actor)}>...`);
 
-  setTimeout(() => {
-    void finalizeTicketClose(channel, nextTicket).catch((error) => {
-      logger.error({ err: error, channelId: channel.id }, "Failed to finalize ticket close");
-    });
-  }, 30_000);
-}
-
-async function finalizeTicketClose(
-  channel: TextChannel,
-  ticket: TicketMetadata,
-): Promise<void> {
   await channel.permissionOverwrites.set(
-    buildClosedTicketOverwrites(channel.guild, ticket),
+    buildClosedTicketOverwrites(channel.guild, nextTicket),
   );
   await channel.setName(`closed-${channel.name.replace(/^ticket-/, "").slice(0, 70)}`);
 
+  let logChannel: TextChannel | null = null;
   try {
-    await saveTicketTranscript(channel, ticket);
+    logChannel = await saveTicketTranscript(channel, nextTicket);
   } catch (error) {
     logger.error({ err: error, channelId: channel.id }, "Automatic transcript save on close failed");
   }
+
+  await replyToActor(
+    actor,
+    logChannel
+      ? `✅ Ticket closed. Transcript saved to ${logChannel}.`
+      : "✅ Ticket closed. Transcript could not be saved automatically.",
+  );
 
   await channel.delete("Ticket closed - automatic cleanup").catch((error) => {
     logger.error({ err: error, channelId: channel.id }, "Failed to auto-delete closed ticket channel");
