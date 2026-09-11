@@ -937,7 +937,8 @@ async function openSayModal(interaction: ButtonInteraction): Promise<void> {
 
   const titleInput = new TextInputBuilder()
     .setCustomId("embed_title")
-    .setLabel("Embed title (optional, only used if you pick Embed)")
+    .setLabel("Embed Title (optional)")
+    .setPlaceholder("Only used if you choose \"Send as Embed\"")
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setMaxLength(256);
