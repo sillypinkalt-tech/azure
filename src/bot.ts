@@ -28,9 +28,9 @@ import {
 } from "discord.js";
 import { logger } from "./lib/logger.js";
 
-const BRAND_NAME = "Azure | MM Service";
-const TICKET_CATEGORY_NAME = "Azure | MM Service";
-const TICKET_TOPIC_PREFIX = "azure-ticket:";
+const BRAND_NAME = "MM2 Community";
+const TICKET_CATEGORY_NAME = "MM2 Community";
+const TICKET_TOPIC_PREFIX = "mm2-ticket:";
 const BRAND_PURPLE = 0x8b5cf6;
 const TICKET_CONFIG_PATH = join(process.cwd(), "data", "ticket-config.json");
 
@@ -666,7 +666,7 @@ async function sendTicketPanel(channel: TextChannel): Promise<void> {
       [
         "Welcome to our middleman service centre.",
         "",
-        "At **Azure | MM Service**, we provide a safe and secure way to exchange your goods.",
+        "At **MM2 Community**, we provide a safe and secure way to exchange your goods.",
         "",
         "If you have found a trade and want to ensure your safety, you can use our middleman service.",
         "",
@@ -676,9 +676,9 @@ async function sendTicketPanel(channel: TextChannel): Promise<void> {
         "• State the trade and value clearly.",
         "• Fake or troll tickets will result in punishments.",
         "",
-        "*Powered by Azure*",
+        "*Powered by MM2 Community*",
         "",
-        "**Azure | MM Service**",
+        "**MM2 Community**",
       ].join("\n"),
     );
 
@@ -1017,9 +1017,13 @@ async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
       return;
     }
 
+    // Acknowledge immediately because channel fetching/sending can take longer
+    // than Discord's 3-second interaction window.
+    await interaction.deferUpdate();
+
     const draft = sayDrafts.get(authorId);
     if (!draft) {
-      await interaction.update({
+      await interaction.editReply({
         content: "This draft has expired. Run `$say` again.",
         components: [],
       });
@@ -1029,7 +1033,7 @@ async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
     try {
       const targetChannel = await interaction.guild?.channels.fetch(draft.channelId);
       if (!targetChannel || !isTextChannel(targetChannel)) {
-        await interaction.update({
+        await interaction.editReply({
           content: "I couldn't find the channel this message was meant for.",
           components: [],
         });
@@ -1047,10 +1051,10 @@ async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
       }
 
       sayDrafts.delete(authorId);
-      await interaction.update({ content: `Message sent to ${targetChannel}.`, components: [] });
+      await interaction.editReply({ content: `Message sent to ${targetChannel}.`, components: [] });
     } catch (error) {
       logger.error({ err: error }, "Say send failed");
-      await interaction.update({ content: "I couldn't send that message.", components: [] });
+      await interaction.editReply({ content: "I couldn't send that message.", components: [] });
     }
   }
 }
@@ -1128,8 +1132,8 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
     return;
   }
 
-  // Acknowledge only the slower ticket-action buttons immediately so Discord
-  // does not time out while the action performs Discord API operations.
+  // Acknowledge every slower ticket action immediately so Discord does not
+  // show "didn't respond in time" while Discord API work is running.
   const slowTicketAction = [
     "ticket:claim",
     "ticket:unclaim",
@@ -1231,7 +1235,7 @@ async function handleTicketModal(
           "Use `$tickethelp` to see ticket commands.",
         ].join("\n"),
       )
-      .setFooter({ text: "Azure | MM Service" });
+      .setFooter({ text: "MM2 Community" });
 
     const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
@@ -1986,14 +1990,10 @@ async function replyToActor(
     await actor.reply(content);
     return;
   }
-
-  // Button interactions are acknowledged immediately with deferUpdate(), so
-  // send the eventual private result as a follow-up instead of replying twice.
   if (actor.deferred || actor.replied) {
     await actor.followUp({ content, ephemeral: true });
     return;
   }
-
   await actor.reply({ content, ephemeral: true });
 }
 
