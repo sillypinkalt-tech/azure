@@ -41,7 +41,7 @@ const TICKET_COMMAND_GUIDE = [
   ["`$transfer @user`", "transfer the ticket to another configured staff member"],
   ["`$add @user`", "add someone to the current ticket (claim roles, admins, or the ticket owner)"],
   ["`$remove @user`", "remove a previously added member from the current ticket"],
-  ["`$ticketclose`", "close and lock the current ticket (configured staff roles or administrators)"],
+  ["`$close` / `$ticketclose`", "close the current ticket, save its transcript, and delete it 30 seconds later (configured staff roles or administrators)"],
   ["`$tickettranscript`", "save and log the ticket conversation (configured staff roles or administrators)"],
   ["`$ticketconfig`", "change the roles that can claim tickets (administrators only)"],
   ["`$tickethelp`", "show ticket commands only"],
@@ -582,6 +582,7 @@ async function handlePrefixCommand(message: Message): Promise<void> {
       );
       return;
     case "ticketclose":
+    case "close":
       await closeTicket(message, ticketContext.channel, ticketContext.ticket);
       return;
     case "tickettranscript":
@@ -1414,38 +1415,47 @@ async function closeTicket(
   }
 
   if (ticket.state === "closed") {
-    await replyToActor(actor, "This ticket is already closed.");
+    await replyToActor(actor, "This ticket is already closing or closed.");
     return;
   }
 
+  // Mark the ticket closed right away so a second $close/$ticketclose during
+  // the 30s window is caught by the check above instead of scheduling a
+  // second close. The actual lock/rename/transcript/delete all happen
+  // together once the timer finishes.
   const nextTicket = { ...ticket, state: "closed" as const };
   await updateTicket(channel, nextTicket);
+
+  await channel.send(
+    `Ticket closing initiated by <@${getActorId(actor)}>. This ticket will be closed and deleted in 30 seconds.`,
+  );
+  await replyToActor(actor, "The ticket will be closed and deleted in 30 seconds.");
+
+  setTimeout(() => {
+    void finalizeTicketClose(channel, nextTicket).catch((error) => {
+      logger.error({ err: error, channelId: channel.id }, "Failed to finalize ticket close");
+    });
+  }, 30_000);
+}
+
+async function finalizeTicketClose(
+  channel: TextChannel,
+  ticket: TicketMetadata,
+): Promise<void> {
   await channel.permissionOverwrites.set(
-    buildClosedTicketOverwrites(channel.guild, nextTicket),
+    buildClosedTicketOverwrites(channel.guild, ticket),
   );
   await channel.setName(`closed-${channel.name.replace(/^ticket-/, "").slice(0, 70)}`);
 
-  let logChannel: TextChannel | null = null;
   try {
-    logChannel = await saveTicketTranscript(channel, nextTicket);
+    await saveTicketTranscript(channel, ticket);
   } catch (error) {
     logger.error({ err: error, channelId: channel.id }, "Automatic transcript save on close failed");
   }
 
-  await channel.send(
-    [
-      `Ticket closed by <@${getActorId(actor)}>.`,
-      logChannel ? `Transcript saved to ${logChannel}.` : "Transcript could not be saved automatically.",
-      "This channel will be deleted in 30 seconds.",
-    ].join(" "),
-  );
-  await replyToActor(actor, "The ticket has been closed. It will be deleted in 30 seconds.");
-
-  setTimeout(() => {
-    void channel.delete("Ticket closed - automatic cleanup").catch((error) => {
-      logger.error({ err: error, channelId: channel.id }, "Failed to auto-delete closed ticket channel");
-    });
-  }, 30_000);
+  await channel.delete("Ticket closed - automatic cleanup").catch((error) => {
+    logger.error({ err: error, channelId: channel.id }, "Failed to auto-delete closed ticket channel");
+  });
 }
 
 async function saveTicketTranscript(
@@ -1626,7 +1636,7 @@ function ticketHelpEmbed(): EmbedBuilder {
         name: "Ticket users",
         value: [
           "`$add @user` — add someone to your ticket",
-          "`$ticketclose` — close the ticket (configured staff roles/admins)",
+          "`$close` — close the ticket (configured staff roles/admins)",
         ].join("\n"),
       },
       {
@@ -1637,7 +1647,7 @@ function ticketHelpEmbed(): EmbedBuilder {
           "`$transfer @user` — transfer it to another configured staff member",
           "`$add @user` — add someone to the ticket",
           "`$remove @user` — remove a previously added member",
-          "`$ticketclose` — close and lock the ticket",
+          "`$close` — close and lock the ticket",
           "`$tickettranscript` — save and log the conversation",
         ].join("\n"),
       },
