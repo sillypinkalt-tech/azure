@@ -1082,69 +1082,82 @@ async function syncOpenTicketPermissions(guild: Guild): Promise<void> {
 }
 
 async function handleTicketButton(interaction: ButtonInteraction): Promise<void> {
-  if (interaction.customId === "ticket:open") {
-    const modal = new ModalBuilder()
-      .setCustomId("ticket:create")
-      .setTitle("Request Middleman");
-
-    const traderInput = new TextInputBuilder()
-      .setCustomId("other_trader")
-      .setLabel("Other trader's username")
-      .setPlaceholder("Enter their Discord username")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setMaxLength(100);
-
-    const tradeInput = new TextInputBuilder()
-      .setCustomId("trade")
-      .setLabel("What are you trading?")
-      .setPlaceholder("Describe the trade and value")
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true)
-      .setMaxLength(1000);
-
-    modal.addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(traderInput),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(tradeInput),
-    );
-
-    await interaction.showModal(modal);
-    return;
-  }
-
-  if (interaction.customId.startsWith("ticket:roles:")) {
-    await showRoleConfigModal(interaction);
-    return;
-  }
-
-  if (interaction.customId.startsWith("say:")) {
-    await handleSayButton(interaction);
-    return;
-  }
-
-  const channel = getInteractionTextChannel(interaction);
-  const ticket = channel ? decodeTicketTopic(channel.topic) : null;
-  if (!channel || !ticket) {
-    await interaction.reply({
-      content: "This button can only be used inside an active ticket.",
-      ephemeral: true,
-    });
-    return;
-  }
-
-  // Acknowledge every slower ticket action immediately so Discord does not
-  // show "didn't respond in time" while Discord API work is running.
-  const slowTicketAction = [
-    "ticket:claim",
-    "ticket:unclaim",
-    "ticket:close",
-    "ticket:transcript",
-  ].includes(interaction.customId);
-  if (slowTicketAction) {
-    await interaction.deferUpdate();
-  }
-
   try {
+    // These buttons must open a modal, so they are acknowledged by
+    // showModal() itself. Do NOT defer them first.
+    if (interaction.customId === "ticket:open") {
+      const modal = new ModalBuilder()
+        .setCustomId("ticket:create")
+        .setTitle("Request Middleman");
+
+      const traderInput = new TextInputBuilder()
+        .setCustomId("other_trader")
+        .setLabel("Other trader's username")
+        .setPlaceholder("Enter their Discord username")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(100);
+
+      const tradeInput = new TextInputBuilder()
+        .setCustomId("trade")
+        .setLabel("What are you trading?")
+        .setPlaceholder("Describe the trade and value")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000);
+
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(traderInput),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(tradeInput),
+      );
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.customId.startsWith("ticket:roles:")) {
+      await showRoleConfigModal(interaction);
+      return;
+    }
+
+    if (interaction.customId.startsWith("say:open:")) {
+      // showModal() is the acknowledgement for this button.
+      await handleSayButton(interaction);
+      return;
+    }
+
+    // All remaining $say buttons are safe to acknowledge immediately.
+    // This prevents Discord's 3-second timeout while channel API work runs.
+    if (
+      interaction.customId.startsWith("say:send:") ||
+      interaction.customId.startsWith("say:cancel:")
+    ) {
+      await handleSayButton(interaction);
+      return;
+    }
+
+    const channel = getInteractionTextChannel(interaction);
+    const ticket = channel ? decodeTicketTopic(channel.topic) : null;
+    if (!channel || !ticket) {
+      await interaction.reply({
+        content: "This button can only be used inside an active ticket.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Acknowledge every ticket action immediately so Discord never waits for
+    // channel/permission/transcript API calls to finish before acknowledging.
+    const ticketAction = [
+      "ticket:claim",
+      "ticket:unclaim",
+      "ticket:close",
+      "ticket:transcript",
+    ].includes(interaction.customId);
+    if (ticketAction) {
+      await interaction.deferUpdate();
+    }
+
     switch (interaction.customId) {
       case "ticket:claim":
         await claimTicket(interaction, channel, ticket);
@@ -1165,10 +1178,14 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
         });
         return;
       default:
+        // Unknown buttons are also acknowledged instead of silently timing out.
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.deferUpdate();
+        }
         return;
     }
   } catch (error) {
-    await reportInteractionError(interaction, error, "Ticket button failed");
+    await reportInteractionError(interaction, error, "Button interaction failed");
   }
 }
 
