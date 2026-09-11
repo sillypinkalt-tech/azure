@@ -1128,6 +1128,18 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
     return;
   }
 
+  // Acknowledge only the slower ticket-action buttons immediately so Discord
+  // does not time out while the action performs Discord API operations.
+  const slowTicketAction = [
+    "ticket:claim",
+    "ticket:unclaim",
+    "ticket:close",
+    "ticket:transcript",
+  ].includes(interaction.customId);
+  if (slowTicketAction) {
+    await interaction.deferUpdate();
+  }
+
   try {
     switch (interaction.customId) {
       case "ticket:claim":
@@ -1974,6 +1986,14 @@ async function replyToActor(
     await actor.reply(content);
     return;
   }
+
+  // Button interactions are acknowledged immediately with deferUpdate(), so
+  // send the eventual private result as a follow-up instead of replying twice.
+  if (actor.deferred || actor.replied) {
+    await actor.followUp({ content, ephemeral: true });
+    return;
+  }
+
   await actor.reply({ content, ephemeral: true });
 }
 
