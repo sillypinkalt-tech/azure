@@ -316,6 +316,7 @@ async function configureTempRole(message: Message): Promise<void> {
 
   await saveTempRoleConfig(message.guild.id, roles.map((role) => role.id));
   await message.reply({
+    allowedMentions: { parse: [] },
     embeds: [
       new EmbedBuilder()
         .setColor(BRAND_PURPLE)
@@ -376,16 +377,19 @@ async function applyTempRole(message: Message): Promise<void> {
 
       if (rolesToRemove.length > 0) await message.member.roles.remove(rolesToRemove, "Restored roles from temp mode");
       if (rolesToRestore.length > 0) await message.member.roles.add(rolesToRestore, "Restored roles from temp mode");
-      await message.member.roles.remove(tempRoles.map((role) => role.id), "Removed configured temp roles after temp mode");
+      // Configured temp roles are permanent requirements/kept roles.
+      // Do NOT remove them when leaving temp mode. Only restore the roles
+      // that were temporarily removed when temp mode was first enabled.
       await clearTempRoleBackup(message.guild.id, message.member.id);
 
       const missingRoleCount = savedRoleIds.length - rolesToRestore.length;
       await message.reply({
+        allowedMentions: { parse: [] },
         embeds: [
           new EmbedBuilder()
             .setColor(BRAND_PURPLE)
             .setTitle(`${BRAND_NAME} · Temp Mode Removed`)
-            .setDescription("Your saved roles have been restored and the configured temp roles were removed.")
+            .setDescription("Your saved roles have been restored. Your configured temp roles are still kept.")
             .setFooter({ text: missingRoleCount > 0 ? `${missingRoleCount} saved role(s) no longer exist or could not be managed.` : "Use $temp again to apply temp mode." }),
         ],
       });
@@ -401,6 +405,7 @@ async function applyTempRole(message: Message): Promise<void> {
     if (removableRoleIds.length > 0) await message.member.roles.remove(removableRoleIds, "Applied configured temp roles");
 
     await message.reply({
+      allowedMentions: { parse: [] },
       embeds: [
         new EmbedBuilder()
           .setColor(BRAND_PURPLE)
