@@ -59,6 +59,12 @@ const ADMIN_COMMAND_GUIDE = [
   ["`$say`", "compose and send a message (plain or embed) as the bot in the current channel (administrators only)"],
 ] as const;
 
+const VOUCH_COMMAND_GUIDE = [
+  ["`$addvouch <amount> [@user]`", "add vouches to yourself or a mentioned user (configured staff roles or administrators, usable anywhere)"],
+  ["`$vouches [@user]`", "show a vouch count for yourself or a mentioned user (configured staff roles or administrators, usable anywhere)"],
+  ["`$removevouch [@user]`", "reset all vouches for yourself or a mentioned user (configured staff roles or administrators, usable anywhere)"],
+] as const;
+
 type TicketState = "open" | "claimed" | "closed";
 
 type TicketMetadata = {
@@ -110,6 +116,8 @@ let startPromise: Promise<void> | null = null;
 const ticketConfigs = new Map<string, TicketConfig>();
 type SayDraft = { channelId: string; content: string; title: string | null };
 const sayDrafts = new Map<string, SayDraft>();
+const vouchCounts = new Map<string, number>();
+const VOUCH_STORE_PATH = join(process.cwd(), "data", "vouch-counts.json");
 
 export function getDiscordBotStatus(): DiscordBotStatus {
   return {
@@ -138,6 +146,7 @@ async function connectDiscordBot(): Promise<void> {
   }
 
   await loadTicketConfigs();
+  await loadVouchCounts();
   status.state = "starting";
   status.lastError = null;
   status.startedAt = new Date().toISOString();
@@ -327,6 +336,50 @@ async function persistTicketConfigs(): Promise<void> {
     TICKET_CONFIG_PATH,
     JSON.stringify(Object.fromEntries(ticketConfigs), null, 2),
   );
+}
+
+function vouchKey(guildId: string, userId: string): string {
+  return `${guildId}:${userId}`;
+}
+
+async function loadVouchCounts(): Promise<void> {
+  try {
+    const raw = await readFile(VOUCH_STORE_PATH, "utf8");
+    const saved = JSON.parse(raw) as Record<string, number>;
+    for (const [key, value] of Object.entries(saved)) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        vouchCounts.set(key, value);
+      }
+    }
+    logger.info({ count: vouchCounts.size }, "Vouch counts loaded");
+  } catch (error) {
+    if (isFileNotFoundError(error)) {
+      return;
+    }
+    logger.error({ err: error }, "Vouch counts could not be loaded");
+  }
+}
+
+async function persistVouchCounts(): Promise<void> {
+  await mkdir(join(process.cwd(), "data"), { recursive: true });
+  await writeFile(VOUCH_STORE_PATH, JSON.stringify(Object.fromEntries(vouchCounts), null, 2));
+}
+
+function getVouchCount(guildId: string, userId: string): number {
+  return vouchCounts.get(vouchKey(guildId, userId)) ?? 0;
+}
+
+async function addVouches(guildId: string, userId: string, amount: number): Promise<number> {
+  const key = vouchKey(guildId, userId);
+  const nextTotal = Math.max(0, (vouchCounts.get(key) ?? 0) + amount);
+  vouchCounts.set(key, nextTotal);
+  await persistVouchCounts();
+  return nextTotal;
+}
+
+async function resetVouches(guildId: string, userId: string): Promise<void> {
+  vouchCounts.delete(vouchKey(guildId, userId));
+  await persistVouchCounts();
 }
 
 async function configureTempRole(message: Message): Promise<void> {
@@ -562,6 +615,21 @@ async function handlePrefixCommand(message: Message): Promise<void> {
 
   if (command === "say") {
     await startSayCommand(message);
+    return;
+  }
+
+  if (command === "addvouch") {
+    await handleAddVouch(message, args);
+    return;
+  }
+
+  if (command === "vouches") {
+    await handleVouchesCommand(message);
+    return;
+  }
+
+  if (command === "removevouch") {
+    await handleRemoveVouch(message);
     return;
   }
 
@@ -1744,6 +1812,71 @@ async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Pr
   }
 }
 
+async function handleAddVouch(message: Message, args: string[]): Promise<void> {
+  if (!canClaimTicket(message)) {
+    await message.reply("Only an administrator or a member with an allowed claim role can use `$addvouch`.");
+    return;
+  }
+
+  const amountToken = args.find((token) => /^\d+$/.test(token));
+  const amount = amountToken ? Number.parseInt(amountToken, 10) : NaN;
+  if (!Number.isFinite(amount) || amount <= 0) {
+    await message.reply("Use `$addvouch <amount> [@user]` — for example `$addvouch 5`.");
+    return;
+  }
+
+  const target = message.mentions.members?.first() ?? message.member;
+  if (!target || !message.guild) {
+    await message.reply("I couldn't determine who to add vouches for.");
+    return;
+  }
+
+  const newTotal = await addVouches(message.guild.id, target.id, amount);
+  const isSelf = target.id === message.author.id;
+  await message.reply(
+    `✅ Added ${amount} vouches. ${isSelf ? "You now have" : `<@${target.id}> now has`} ${newTotal} vouches.`,
+  );
+}
+
+async function handleVouchesCommand(message: Message): Promise<void> {
+  if (!canClaimTicket(message)) {
+    await message.reply("Only an administrator or a member with an allowed claim role can use `$vouches`.");
+    return;
+  }
+
+  const target = message.mentions.members?.first() ?? message.member;
+  if (!target || !message.guild) {
+    await message.reply("I couldn't determine whose vouches to show.");
+    return;
+  }
+
+  const count = getVouchCount(message.guild.id, target.id);
+  const embed = new EmbedBuilder()
+    .setColor(SUCCESS_GREEN)
+    .setDescription(`**${target.displayName}** currently has ${count} vouches.`)
+    .setThumbnail(target.user.displayAvatarURL())
+    .setFooter({ text: `Vouch Count • ${BRAND_NAME}` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function handleRemoveVouch(message: Message): Promise<void> {
+  if (!canClaimTicket(message)) {
+    await message.reply("Only an administrator or a member with an allowed claim role can use `$removevouch`.");
+    return;
+  }
+
+  const target = message.mentions.members?.first() ?? message.member;
+  if (!target || !message.guild) {
+    await message.reply("I couldn't determine whose vouches to remove.");
+    return;
+  }
+
+  await resetVouches(message.guild.id, target.id);
+  const isSelf = target.id === message.author.id;
+  await message.reply(`✅ Removed all ${isSelf ? "your" : `<@${target.id}>'s`} vouches.`);
+}
+
 async function sendTicketHelp(message: Message): Promise<void> {
   await message.reply({ embeds: [ticketHelpEmbed()] });
 }
@@ -1760,6 +1893,7 @@ function commandListText(): string {
     ...TICKET_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
     ...TEMP_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
     ...ADMIN_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
+    ...VOUCH_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
   ].join("\n");
 }
 
