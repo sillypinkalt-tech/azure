@@ -1683,6 +1683,8 @@ function buildOverwritesForState(guild: Guild, ticket: TicketMetadata): Overwrit
 const SUCCESS_GREEN = 0x57f287;
 const DANGER_RED = 0xed4245;
 
+const MM_DIAGRAM_PATH = join(process.cwd(), "assets", "mm-diagram.png");
+
 async function sendMiddlemanHowTo(message: Message, channel: TextChannel): Promise<void> {
   if (!canClaimTicket(message)) {
     await message.reply("Only an administrator or a member with an allowed claim role can use `$mmhow`.");
@@ -1691,19 +1693,25 @@ async function sendMiddlemanHowTo(message: Message, channel: TextChannel): Promi
 
   const embed = new EmbedBuilder()
     .setColor(BRAND_PURPLE)
-    .setTitle("📋 Middleman Info")
+    .setTitle("🪙 How the Middleman Process Works")
     .setDescription(
       [
-        "**A Middleman (MM)** is a trusted staff member who makes trades safe.",
+        "A Middleman (MM) secures high-value trades so neither side gets scammed 🛡️",
         "",
-        "**MM Rules**",
-        "• Once a ticket is created, the MM who claims it must finish it.",
-        "• After the trade finishes, you must vouch.",
+        "📋 **Trade Agreement**",
+        "Both parties agree on the exact terms of the deal in a private channel or group.",
         "",
-        "**🔧 How Does a MM Work?**",
-        "1️⃣ Seller gives item(s) to the MM.",
-        "2️⃣ Buyer sends payment to seller.",
-        "3️⃣ MM delivers to buyer.",
+        "🔐 **Handing Over the Asset**",
+        "The seller hands over the item/account credentials to the official Middleman.",
+        "",
+        "🔍 **Securing the Goods**",
+        "The Middleman verifies that the item or account is valid and holds it safely.",
+        "",
+        "💸 **Sending Payment**",
+        "The buyer sends the agreed-upon payment directly to the seller.",
+        "",
+        "🎁 **Releasing the Asset**",
+        "Once the seller confirms the payment is received, the Middleman transfers the item/account to the buyer.",
       ].join("\n"),
     )
     .setFooter({ text: BRAND_NAME });
@@ -1713,7 +1721,14 @@ async function sendMiddlemanHowTo(message: Message, channel: TextChannel): Promi
     new ButtonBuilder().setCustomId("mm:understand:no").setLabel("I Don't Understand").setStyle(ButtonStyle.Danger),
   );
 
-  await channel.send({ embeds: [embed], components: [row] });
+  try {
+    const diagram = new AttachmentBuilder(MM_DIAGRAM_PATH, { name: "mm-diagram.png" });
+    embed.setImage("attachment://mm-diagram.png");
+    await channel.send({ embeds: [embed], components: [row], files: [diagram] });
+  } catch (error) {
+    logger.error({ err: error }, "Could not attach mm-diagram.png, sending $mmhow without the image");
+    await channel.send({ embeds: [embed], components: [row] });
+  }
 }
 
 async function sendTradeConfirmationPanel(message: Message, channel: TextChannel): Promise<void> {
@@ -1751,12 +1766,15 @@ async function sendMiddlemanFeePanel(message: Message, channel: TextChannel): Pr
 
   const embed = new EmbedBuilder()
     .setColor(BRAND_PURPLE)
-    .setTitle("💰 Middleman Fees")
     .setDescription(
       [
-        "Now that the middleman has the item(s), we can proceed.",
+        "# 🔒 Assets Secured",
+        "The middleman is holding the items safely in escrow 🛡️. Please send the fee now so we can verify it and release the items! 🚀",
         "",
-        "Choose an option below:",
+        "# Why We Charge Fees?",
+        "Fees keep the server running smoothly 🪂 pay for our custom bots ⚙️",
+        "and compensate our Trusted Middlemans",
+        "for securing your trade without scams!",
       ].join("\n"),
     )
     .setFooter({ text: BRAND_NAME });
