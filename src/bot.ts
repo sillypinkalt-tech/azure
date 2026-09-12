@@ -41,8 +41,11 @@ const TICKET_COMMAND_GUIDE = [
   ["`$transfer @user`", "transfer the ticket to another configured staff member"],
   ["`$add @user`", "add someone to the current ticket (claim roles, admins, or the ticket owner)"],
   ["`$remove @user`", "remove a previously added member from the current ticket"],
-  ["`$close` / `$ticketclose`", "close the current ticket, save its transcript, and delete it immediately (configured staff roles or administrators)"],
+  ["`$close` / `$ticketclose`", "close the current ticket, save its transcript, and delete it after 30 seconds (configured staff roles or administrators)"],
   ["`$tickettranscript`", "save and log the ticket conversation (configured staff roles or administrators)"],
+  ["`$mmhow`", "post the Middleman info panel with I Understand / I Don't Understand buttons (configured staff roles or administrators)"],
+  ["`$conf`", "post a trade confirmation panel with Confirm / Decline buttons (configured staff roles or administrators)"],
+  ["`$fee`", "post the middleman fee panel with Pay 50% / Pay 100% buttons (configured staff roles or administrators)"],
   ["`$ticketconfig`", "change the roles that can claim tickets (administrators only)"],
   ["`$tickethelp`", "show ticket commands only"],
 ] as const;
@@ -606,6 +609,15 @@ async function handlePrefixCommand(message: Message): Promise<void> {
         ticketContext.ticket,
       );
       return;
+    case "mmhow":
+      await sendMiddlemanHowTo(message, ticketContext.channel);
+      return;
+    case "conf":
+      await sendTradeConfirmationPanel(message, ticketContext.channel);
+      return;
+    case "fee":
+      await sendMiddlemanFeePanel(message, ticketContext.channel);
+      return;
     default:
       if (args.length > 0) {
         return;
@@ -1138,6 +1150,11 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
       return;
     }
 
+    if (interaction.customId.startsWith("mm:")) {
+      await handleMiddlemanWorkflowButton(interaction);
+      return;
+    }
+
     const channel = getInteractionTextChannel(interaction);
     const ticket = channel ? decodeTicketTopic(channel.topic) : null;
     if (!channel || !ticket) {
@@ -1593,6 +1610,138 @@ function buildOverwritesForState(guild: Guild, ticket: TicketMetadata): Overwrit
     return buildClaimedTicketOverwrites(guild, ticket);
   }
   return buildUnclaimedTicketOverwrites(guild, ticket);
+}
+
+const SUCCESS_GREEN = 0x57f287;
+const DANGER_RED = 0xed4245;
+
+async function sendMiddlemanHowTo(message: Message, channel: TextChannel): Promise<void> {
+  if (!canClaimTicket(message)) {
+    await message.reply("Only an administrator or a member with an allowed claim role can use `$mmhow`.");
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(BRAND_PURPLE)
+    .setTitle("📋 Middleman Info")
+    .setDescription(
+      [
+        "**A Middleman (MM)** is a trusted staff member who makes trades safe.",
+        "",
+        "**MM Rules**",
+        "• Once a ticket is created, the MM who claims it must finish it.",
+        "• After the trade finishes, you must vouch.",
+        "",
+        "**🔧 How Does a MM Work?**",
+        "1️⃣ Seller gives item(s) to the MM.",
+        "2️⃣ Buyer sends payment to seller.",
+        "3️⃣ MM delivers to buyer.",
+      ].join("\n"),
+    )
+    .setFooter({ text: BRAND_NAME });
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("mm:understand:yes").setLabel("I Understand").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("mm:understand:no").setLabel("I Don't Understand").setStyle(ButtonStyle.Danger),
+  );
+
+  await channel.send({ embeds: [embed], components: [row] });
+}
+
+async function sendTradeConfirmationPanel(message: Message, channel: TextChannel): Promise<void> {
+  if (!canClaimTicket(message)) {
+    await message.reply("Only an administrator or a member with an allowed claim role can use `$conf`.");
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(BRAND_PURPLE)
+    .setTitle("📋 Confirmations")
+    .setDescription(
+      [
+        "Do both users confirm the trade?",
+        "",
+        "**Press Confirm** if you confirm.",
+        "**Press Decline** if you do not confirm.",
+      ].join("\n"),
+    )
+    .setFooter({ text: BRAND_NAME });
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("mm:confirm:yes").setLabel("Confirm").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("mm:confirm:no").setLabel("Decline").setStyle(ButtonStyle.Danger),
+  );
+
+  await channel.send({ embeds: [embed], components: [row] });
+}
+
+async function sendMiddlemanFeePanel(message: Message, channel: TextChannel): Promise<void> {
+  if (!canClaimTicket(message)) {
+    await message.reply("Only an administrator or a member with an allowed claim role can use `$fee`.");
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(BRAND_PURPLE)
+    .setTitle("💰 Middleman Fees")
+    .setDescription(
+      [
+        "Now that the middleman has the item(s), we can proceed.",
+        "",
+        "Choose an option below:",
+      ].join("\n"),
+    )
+    .setFooter({ text: BRAND_NAME });
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("mm:fee:50").setLabel("Pay 50%").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("mm:fee:100").setLabel("Pay 100%").setStyle(ButtonStyle.Success),
+  );
+
+  await channel.send({ embeds: [embed], components: [row] });
+}
+
+async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Promise<void> {
+  if (interaction.customId.startsWith("mm:understand:")) {
+    const understood = interaction.customId.endsWith(":yes");
+    const embed = new EmbedBuilder()
+      .setColor(understood ? SUCCESS_GREEN : DANGER_RED)
+      .setTitle(understood ? "User Confirmed Understanding" : "User Does NOT Understand")
+      .setDescription(
+        understood
+          ? `<@${interaction.user.id}> understands how the Middleman works.`
+          : `<@${interaction.user.id}> does **not** understand how the Middleman works.`,
+      );
+    await interaction.reply({ embeds: [embed] });
+    return;
+  }
+
+  if (interaction.customId.startsWith("mm:confirm:")) {
+    const confirmed = interaction.customId.endsWith(":yes");
+    const embed = new EmbedBuilder()
+      .setColor(confirmed ? SUCCESS_GREEN : DANGER_RED)
+      .setTitle(confirmed ? "Trade Confirmed" : "Trade Declined")
+      .setDescription(
+        confirmed
+          ? `<@${interaction.user.id}> confirmed the trade.`
+          : `<@${interaction.user.id}> declined the trade.`,
+      );
+    await interaction.reply({ embeds: [embed] });
+    return;
+  }
+
+  if (interaction.customId.startsWith("mm:fee:")) {
+    const isFullFee = interaction.customId.endsWith(":100");
+    const embed = new EmbedBuilder()
+      .setColor(isFullFee ? SUCCESS_GREEN : BRAND_PURPLE)
+      .setTitle(isFullFee ? "100% Fee Chosen" : "50% Fee Chosen")
+      .setDescription(
+        isFullFee
+          ? `<@${interaction.user.id}> has chosen to pay the full fee.`
+          : `<@${interaction.user.id}> has chosen to split the fee **50/50**.`,
+      );
+    await interaction.reply({ embeds: [embed] });
+  }
 }
 
 async function sendTicketHelp(message: Message): Promise<void> {
