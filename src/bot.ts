@@ -384,7 +384,6 @@ async function resetVouches(guildId: string, userId: string): Promise<void> {
 
 async function configureTempRole(message: Message): Promise<void> {
   if (!message.member || !isAdministrator(message.member)) {
-    await message.reply("Only server administrators can configure the temp roles.");
     return;
   }
 
@@ -454,7 +453,6 @@ async function applyTempRole(message: Message): Promise<void> {
   }
 
   if (tempRoles.some((role) => !message.member!.roles.cache.has(role.id))) {
-    await message.reply(`You need to have all configured temp roles (${tempRoles.join(" ")}) to use $temp.`);
     return;
   }
 
@@ -698,7 +696,6 @@ async function startTicketSetup(
   mode: "setup" | "config",
 ): Promise<void> {
   if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
-    await message.reply("Only server administrators can configure ticket claim roles.");
     return;
   }
 
@@ -782,10 +779,6 @@ async function showRoleConfigModal(interaction: ButtonInteraction): Promise<void
     interaction.user.id !== adminId ||
     !isAdministrator(interaction.member)
   ) {
-    await interaction.reply({
-      content: "Only the administrator who started this setup can configure claim roles.",
-      ephemeral: true,
-    });
     return;
   }
 
@@ -817,10 +810,6 @@ async function saveRoleConfigFromModal(
       interaction.user.id !== adminId ||
       !isAdministrator(interaction.member)
     ) {
-      await interaction.reply({
-        content: "Only administrators can save ticket claim roles.",
-        ephemeral: true,
-      });
       return;
     }
 
@@ -925,10 +914,6 @@ async function handleTranscriptChannelSelect(
       interaction.user.id !== adminId ||
       !isAdministrator(interaction.member)
     ) {
-      await interaction.reply({
-        content: "Only the administrator who started this setup can pick the transcript channel.",
-        ephemeral: true,
-      });
       return;
     }
 
@@ -967,7 +952,6 @@ async function handleTranscriptChannelSelect(
 
 async function startSayCommand(message: Message): Promise<void> {
   if (!message.member || !isAdministrator(message.member)) {
-    await message.reply("Only server administrators can use `$say`.");
     return;
   }
 
@@ -996,10 +980,6 @@ async function openSayModal(interaction: ButtonInteraction): Promise<void> {
     interaction.user.id !== authorId ||
     !isAdministrator(interaction.member)
   ) {
-    await interaction.reply({
-      content: "Only the administrator who ran `$say` can write this message.",
-      ephemeral: true,
-    });
     return;
   }
 
@@ -1039,10 +1019,6 @@ async function saveSayDraftFromModal(interaction: ModalSubmitInteraction): Promi
       interaction.user.id !== authorId ||
       !isAdministrator(interaction.member)
     ) {
-      await interaction.reply({
-        content: "Only the administrator who ran `$say` can write this message.",
-        ephemeral: true,
-      });
       return;
     }
 
@@ -1388,10 +1364,6 @@ async function claimTicket(
   ticket: TicketMetadata,
 ): Promise<void> {
   if (!canClaimTicket(actor)) {
-    await replyToActor(
-      actor,
-      "You do not have an allowed claim role. An administrator must configure roles with `$ticketsetup` or `$ticketconfig`.",
-    );
     return;
   }
 
@@ -1421,10 +1393,6 @@ async function unclaimTicket(
   ticket: TicketMetadata,
 ): Promise<void> {
   if (!canClaimTicket(actor)) {
-    await replyToActor(
-      actor,
-      "Only an administrator or a member with an allowed claim role can unclaim tickets.",
-    );
     return;
   }
 
@@ -1434,7 +1402,6 @@ async function unclaimTicket(
   }
 
   if (ticket.claimerId && ticket.claimerId !== getActorId(actor) && !isAdministrator(actor.member)) {
-    await replyToActor(actor, "Only the current claimer or an administrator can unclaim this ticket.");
     return;
   }
 
@@ -1453,9 +1420,6 @@ async function transferTicket(
   ticket: TicketMetadata,
 ): Promise<void> {
   if (!canClaimTicket(message)) {
-    await message.reply(
-      "Only an administrator or a member with an allowed claim role can transfer tickets.",
-    );
     return;
   }
 
@@ -1464,7 +1428,6 @@ async function transferTicket(
     ticket.claimerId !== message.author.id &&
     !isAdministrator(message.member)
   ) {
-    await message.reply("Only the current claimer or an administrator can transfer this ticket.");
     return;
   }
 
@@ -1504,7 +1467,6 @@ async function closeTicket(
   ticket: TicketMetadata,
 ): Promise<void> {
   if (!canClaimTicket(actor)) {
-    await replyToActor(actor, "Only an administrator or a member with an allowed claim role can close tickets.");
     return;
   }
 
@@ -1583,10 +1545,6 @@ async function createTicketTranscript(
   ticket: TicketMetadata,
 ): Promise<void> {
   if (!canClaimTicket(actor)) {
-    await replyToActor(
-      actor,
-      "Only an administrator or a member with an allowed claim role can create transcripts.",
-    );
     return;
   }
 
@@ -1600,7 +1558,6 @@ async function addTicketMember(
   ticket: TicketMetadata,
 ): Promise<void> {
   if (!canClaimTicket(message) && message.author.id !== ticket.ownerId) {
-    await message.reply("Only the ticket owner, a member with an allowed claim role, or an administrator can add members.");
     return;
   }
 
@@ -1635,7 +1592,6 @@ async function removeTicketMember(
   ticket: TicketMetadata,
 ): Promise<void> {
   if (!canClaimTicket(message) && message.author.id !== ticket.ownerId) {
-    await message.reply("Only the ticket owner, a member with an allowed claim role, or an administrator can remove members.");
     return;
   }
 
@@ -1687,7 +1643,6 @@ const MM_DIAGRAM_PATH = join(process.cwd(), "assets", "mm-diagram.png");
 
 async function sendMiddlemanHowTo(message: Message, channel: TextChannel): Promise<void> {
   if (!canClaimTicket(message)) {
-    await message.reply("Only an administrator or a member with an allowed claim role can use `$mmhow`.");
     return;
   }
 
@@ -1733,7 +1688,6 @@ async function sendMiddlemanHowTo(message: Message, channel: TextChannel): Promi
 
 async function sendTradeConfirmationPanel(message: Message, channel: TextChannel): Promise<void> {
   if (!canClaimTicket(message)) {
-    await message.reply("Only an administrator or a member with an allowed claim role can use `$conf`.");
     return;
   }
 
@@ -1760,7 +1714,6 @@ async function sendTradeConfirmationPanel(message: Message, channel: TextChannel
 
 async function sendMiddlemanFeePanel(message: Message, channel: TextChannel): Promise<void> {
   if (!canClaimTicket(message)) {
-    await message.reply("Only an administrator or a member with an allowed claim role can use `$fee`.");
     return;
   }
 
@@ -1832,7 +1785,6 @@ async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Pr
 
 async function handleAddVouch(message: Message, args: string[]): Promise<void> {
   if (!canClaimTicket(message)) {
-    await message.reply("Only an administrator or a member with an allowed claim role can use `$addvouch`.");
     return;
   }
 
@@ -1858,7 +1810,6 @@ async function handleAddVouch(message: Message, args: string[]): Promise<void> {
 
 async function handleVouchesCommand(message: Message): Promise<void> {
   if (!canClaimTicket(message)) {
-    await message.reply("Only an administrator or a member with an allowed claim role can use `$vouches`.");
     return;
   }
 
@@ -1880,7 +1831,6 @@ async function handleVouchesCommand(message: Message): Promise<void> {
 
 async function handleRemoveVouch(message: Message): Promise<void> {
   if (!canClaimTicket(message)) {
-    await message.reply("Only an administrator or a member with an allowed claim role can use `$removevouch`.");
     return;
   }
 
