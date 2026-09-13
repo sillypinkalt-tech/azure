@@ -46,7 +46,8 @@ const TICKET_COMMAND_GUIDE = [
   ["`$mmhow`", "post the Middleman info panel with I Understand / I Don't Understand buttons (configured staff roles or administrators)"],
   ["`$conf`", "post a trade confirmation panel with Confirm / Decline buttons (configured staff roles or administrators)"],
   ["`$fee`", "post the middleman fee panel with Pay 50% / Pay 100% buttons (configured staff roles or administrators)"],
-  ["`$ticketconfig`", "change the roles that can claim tickets (administrators only)"],
+  ["`$join`", "post the Member / Scammer Catcher panel (configured ticket claimer roles or administrators)"],
+  ["`$ticketconfig`", "change the ticket claim role and Accepted Member role (administrators only)"],
   ["`$tickethelp`", "show ticket commands only"],
 ] as const;
 
@@ -81,6 +82,7 @@ type TicketMetadata = {
 type TicketConfig = {
   claimRoleIds: string[];
   transcriptChannelId?: string;
+  joinRoleId?: string;
   tempRoleIds?: string[];
   tempRoleId?: string;
   tempRoleBackups?: Record<string, string[]>;
@@ -229,6 +231,7 @@ async function loadTicketConfigs(): Promise<void> {
 async function saveTicketConfig(
   guildId: string,
   claimRoleIds: string[],
+  joinRoleId?: string,
 ): Promise<TicketConfig> {
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
@@ -236,6 +239,12 @@ async function saveTicketConfig(
     ...(existingConfig?.transcriptChannelId
       ? { transcriptChannelId: existingConfig.transcriptChannelId }
       : {}),
+    ...(joinRoleId
+      ? { joinRoleId }
+      : existingConfig?.joinRoleId
+        ? { joinRoleId: existingConfig.joinRoleId }
+        : {}),
+    ...(existingConfig?.tempRoleIds ? { tempRoleIds: existingConfig.tempRoleIds } : {}),
     ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
     ...(existingConfig?.tempRoleBackups
       ? { tempRoleBackups: existingConfig.tempRoleBackups }
@@ -254,6 +263,7 @@ async function saveTranscriptChannelConfig(
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
     claimRoleIds: existingConfig?.claimRoleIds ?? [],
+    ...(existingConfig?.joinRoleId ? { joinRoleId: existingConfig.joinRoleId } : {}),
     transcriptChannelId,
     ...(existingConfig?.tempRoleIds ? { tempRoleIds: existingConfig.tempRoleIds } : {}),
     ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
@@ -274,6 +284,7 @@ async function saveTempRoleConfig(
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
     claimRoleIds: existingConfig?.claimRoleIds ?? [],
+    ...(existingConfig?.joinRoleId ? { joinRoleId: existingConfig.joinRoleId } : {}),
     tempRoleIds,
     ...(existingConfig?.tempRoleBackups
       ? { tempRoleBackups: existingConfig.tempRoleBackups }
@@ -293,6 +304,7 @@ async function saveTempRoleBackup(
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
     claimRoleIds: existingConfig?.claimRoleIds ?? [],
+    ...(existingConfig?.joinRoleId ? { joinRoleId: existingConfig.joinRoleId } : {}),
     ...(existingConfig?.transcriptChannelId
       ? { transcriptChannelId: existingConfig.transcriptChannelId }
       : {}),
@@ -525,6 +537,9 @@ function isValidTicketConfig(config: unknown): config is TicketConfig {
       (!("transcriptChannelId" in config) ||
         config.transcriptChannelId === undefined ||
         typeof config.transcriptChannelId === "string") &&
+      (!("joinRoleId" in config) ||
+        config.joinRoleId === undefined ||
+        typeof config.joinRoleId === "string") &&
       (!("tempRoleIds" in config) ||
         config.tempRoleIds === undefined ||
         (Array.isArray(config.tempRoleIds) &&
@@ -607,7 +622,10 @@ async function handlePrefixCommand(message: Message): Promise<void> {
   }
 
   if (command === "cmd" || command === "commands") {
-    await message.reply({ embeds: [commandListEmbed()] });
+    if (!canUseCommandGuide(message)) {
+      return;
+    }
+    await message.reply({ embeds: [commandListEmbed(message)] });
     return;
   }
 
@@ -628,6 +646,23 @@ async function handlePrefixCommand(message: Message): Promise<void> {
 
   if (command === "removevouch") {
     await handleRemoveVouch(message);
+    return;
+  }
+
+  if (command === "join") {
+    const ticketContext = getTicketContext(message);
+    if (!ticketContext) {
+      await message.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(DANGER_RED)
+            .setTitle(`${BRAND_NAME} · Ticket Only`)
+            .setDescription("`$join` can only be used inside an active ticket."),
+        ],
+      });
+      return;
+    }
+    await sendJoinPanel(message, ticketContext.channel, ticketContext.ticket);
     return;
   }
 
@@ -787,14 +822,23 @@ async function showRoleConfigModal(interaction: ButtonInteraction): Promise<void
     .setTitle(mode === "setup" ? "Ticket Setup" : "Ticket Config");
   const roleInput = new TextInputBuilder()
     .setCustomId("claim_roles")
-    .setLabel("Mention roles that can claim tickets")
+    .setLabel("Ticket claim roles")
     .setPlaceholder("<@&role-id> <@&role-id>")
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
     .setMaxLength(1000);
 
+  const joinRoleInput = new TextInputBuilder()
+    .setCustomId("join_role")
+    .setLabel("Accepted Member role")
+    .setPlaceholder("Mention the role given after Accept")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(100);
+
   modal.addComponents(
     new ActionRowBuilder<TextInputBuilder>().addComponents(roleInput),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(joinRoleInput),
   );
   await interaction.showModal(modal);
 }
@@ -820,6 +864,8 @@ async function saveRoleConfigFromModal(
 
     const roleInput = interaction.fields.getTextInputValue("claim_roles");
     const roleIds = parseRoleMentions(roleInput);
+    const joinRoleInput = interaction.fields.getTextInputValue("join_role");
+    const joinRoleIds = parseRoleMentions(joinRoleInput);
 
     if (roleIds.length === 0) {
       await interaction.editReply({
@@ -850,14 +896,46 @@ async function saveRoleConfigFromModal(
             .setColor(BRAND_PURPLE)
             .setTitle(`${BRAND_NAME} · Role Setup`)
             .setDescription(
-              "One or more of those roles could not be found in this server. Please double-check the role mention or ID and try again.",
+              "One or more claim roles could not be found in this server. Please double-check the role mention or ID and try again.",
             ),
         ],
       });
       return;
     }
 
-    const config = await saveTicketConfig(interaction.guild.id, validRoleIds);
+    if (joinRoleIds.length !== 1) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(BRAND_PURPLE)
+            .setTitle(`${BRAND_NAME} · Role Setup`)
+            .setDescription("Please mention exactly one valid Accepted Member role."),
+        ],
+      });
+      return;
+    }
+
+    const joinRole = guildRoles.get(joinRoleIds[0]);
+    if (
+      !joinRole ||
+      joinRole.id === interaction.guild.roles.everyone.id ||
+      joinRole.managed ||
+      !joinRole.editable
+    ) {
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(BRAND_PURPLE)
+            .setTitle(`${BRAND_NAME} · Role Setup`)
+            .setDescription(
+              "The Accepted Member role must be a normal role that I can manage. Move my highest role above it and try again.",
+            ),
+        ],
+      });
+      return;
+    }
+
+    const config = await saveTicketConfig(interaction.guild.id, validRoleIds, joinRole.id);
     await syncOpenTicketPermissions(interaction.guild);
     const roleMentions = config.claimRoleIds.map((roleId) => `<@&${roleId}>`).join(" ");
     const needsTranscriptChannel = !config.transcriptChannelId;
@@ -867,6 +945,7 @@ async function saveRoleConfigFromModal(
       .setDescription(
         [
           `Allowed claim roles: ${roleMentions}`,
+          `Accepted Member role: <@&${config.joinRoleId}>`,
           "",
           needsTranscriptChannel
             ? "One more step: pick a channel below to log ticket transcripts."
@@ -1139,6 +1218,204 @@ async function syncOpenTicketPermissions(guild: Guild): Promise<void> {
   );
 }
 
+async function sendJoinPanel(
+  message: Message,
+  channel: TextChannel,
+  ticket: TicketMetadata,
+): Promise<void> {
+  if (!canClaimTicket(message)) {
+    return;
+  }
+
+  if (ticket.state === "closed") {
+    await message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(DANGER_RED)
+          .setTitle(`${BRAND_NAME} · Ticket Closed`)
+          .setDescription("This ticket is already closed."),
+      ],
+    });
+    return;
+  }
+
+  const joinRoleId = ticketConfigs.get(message.guild!.id)?.joinRoleId;
+  const joinRole = joinRoleId ? message.guild!.roles.cache.get(joinRoleId) : null;
+  if (!joinRoleId || !joinRole) {
+    await message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(DANGER_RED)
+          .setTitle(`${BRAND_NAME} · Member Role Not Configured`)
+          .setDescription("An administrator must run `$ticketsetup` and choose the Accepted Member role first."),
+      ],
+    });
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(BRAND_PURPLE)
+    .setTitle("🛡️ Become a Member to Catch Scammers")
+    .setDescription(
+      [
+        "Want to help keep **MM2 Community** safe from scammers?",
+        "",
+        `Press **Accept** to receive ${joinRole}.`,
+        "Press **Reject** if you do not want to become a member.",
+        "",
+        "⚠️ **Rejecting closes this ticket and kicks the user who rejects after 10 seconds.**",
+      ].join("\n"),
+    )
+    .setFooter({ text: BRAND_NAME });
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`join:accept:${ticket.ownerId}:${channel.id}`)
+      .setLabel("Accept")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`join:reject:${ticket.ownerId}:${channel.id}`)
+      .setLabel("Reject")
+      .setEmoji("❌")
+      .setStyle(ButtonStyle.Danger),
+  );
+
+  await channel.send({ embeds: [embed], components: [row] });
+  await message.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(SUCCESS_GREEN)
+        .setTitle(`${BRAND_NAME} · Member Panel Sent`)
+        .setDescription("The Accept / Reject panel has been posted in this ticket."),
+    ],
+  });
+}
+
+async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
+  const [, action, ownerId, channelId] = interaction.customId.split(":");
+  if (!interaction.guild || !action || !ownerId || !channelId) {
+    return;
+  }
+
+  const channel = getInteractionTextChannel(interaction);
+  const ticket = channel ? decodeTicketTopic(channel.topic) : null;
+  if (!channel || !ticket || ticket.ownerId !== ownerId || channel.id !== channelId) {
+    await interaction.reply({
+      content: "This Member panel is no longer connected to an active ticket.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (ticket.state === "closed") {
+    await interaction.reply({ content: "This ticket is already closed.", ephemeral: true });
+    return;
+  }
+
+  const joinRoleId = ticketConfigs.get(interaction.guild.id)?.joinRoleId;
+  const joinRole = joinRoleId ? interaction.guild.roles.cache.get(joinRoleId) : null;
+  if (!joinRole || joinRole.managed || !joinRole.editable) {
+    await interaction.reply({
+      content: "The Accepted Member role is no longer available for me to manage.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (action === "accept") {
+    await interaction.deferUpdate();
+
+    try {
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      if (member.roles.cache.has(joinRole.id)) {
+        await interaction.followUp({ content: `You already have ${joinRole}.`, ephemeral: true });
+        return;
+      }
+
+      await member.roles.add(joinRole, "Accepted MM2 Community member role");
+      await interaction.followUp({
+        content: `✅ You have been accepted and received ${joinRole}.`,
+        ephemeral: true,
+      });
+    } catch (error) {
+      logger.error(
+        { err: error, guildId: interaction.guild.id, userId: interaction.user.id },
+        "Join role assignment failed",
+      );
+      await interaction.followUp({
+        content: "I couldn't give you the Member role. Please ask an administrator to check my role hierarchy.",
+        ephemeral: true,
+      });
+    }
+    return;
+  }
+
+  if (action === "reject") {
+    await interaction.deferUpdate();
+
+    const rejectedMemberId = interaction.user.id;
+    const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`join:accept:${ownerId}:${channelId}`)
+        .setLabel("Accepted")
+        .setEmoji("✅")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(true),
+      new ButtonBuilder()
+        .setCustomId(`join:reject:${ownerId}:${channelId}`)
+        .setLabel("Rejected")
+        .setEmoji("❌")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(true),
+    );
+
+    await interaction.message.edit({ components: [disabledRow] }).catch(() => undefined);
+
+    const nextTicket = { ...ticket, state: "closed" as const };
+    closingTicketChannelIds.add(channel.id);
+
+    setTimeout(async () => {
+      try {
+        const member = await interaction.guild!.members.fetch(rejectedMemberId).catch(() => null);
+        if (member?.kickable) {
+          await member.kick("Rejected Member verification");
+        }
+      } catch (error) {
+        logger.error(
+          { err: error, guildId: interaction.guild?.id, userId: rejectedMemberId },
+          "Rejected user kick failed",
+        );
+      }
+
+      await channel.delete("Member panel rejected - 10 second cleanup").catch((error) => {
+        logger.error({ err: error, channelId: channel.id }, "Failed to delete rejected ticket");
+      });
+      closingTicketChannelIds.delete(channel.id);
+    }, 10_000);
+
+    await channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(DANGER_RED)
+          .setTitle("❌ Member Request Rejected")
+          .setDescription(
+            `<@${rejectedMemberId}> rejected the Member request. This ticket is closed and the user will be kicked in **10 seconds**.`,
+          )
+          .setFooter({ text: BRAND_NAME }),
+      ],
+    });
+
+    await channel.permissionOverwrites.set(buildClosedTicketOverwrites(interaction.guild, nextTicket));
+
+    try {
+      await saveTicketTranscript(channel, nextTicket);
+    } catch (error) {
+      logger.error({ err: error, channelId: channel.id }, "Rejected ticket transcript save failed");
+    }
+  }
+}
+
 async function handleTicketButton(interaction: ButtonInteraction): Promise<void> {
   try {
     // These buttons must open a modal, so they are acknowledged by
@@ -1175,6 +1452,11 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
 
     if (interaction.customId.startsWith("ticket:roles:")) {
       await showRoleConfigModal(interaction);
+      return;
+    }
+
+    if (interaction.customId.startsWith("join:")) {
+      await handleJoinButton(interaction);
       return;
     }
 
@@ -1855,22 +2137,87 @@ function ticketHelpText(): string {
   ].join("\n");
 }
 
-function commandListText(): string {
-  return [
-    "`$cmd` — show this full command guide",
-    ...TICKET_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
-    ...TEMP_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
-    ...ADMIN_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
-    ...VOUCH_COMMAND_GUIDE.map(([command, description]) => `${command} — ${description}`),
-  ].join("\n");
+function hasJoinRole(guildId: string, member: unknown): boolean {
+  const joinRoleId = ticketConfigs.get(guildId)?.joinRoleId;
+  if (!joinRoleId || !member || typeof member !== "object" || !("roles" in member)) {
+    return false;
+  }
+
+  const roles = member.roles;
+  if (!roles || typeof roles !== "object" || !("cache" in roles)) {
+    return false;
+  }
+
+  const roleCache = roles.cache;
+  return Boolean(
+    roleCache &&
+      typeof roleCache === "object" &&
+      "has" in roleCache &&
+      typeof roleCache.has === "function" &&
+      roleCache.has(joinRoleId),
+  );
 }
 
-function commandListEmbed(): EmbedBuilder {
+function canUseCommandGuide(message: Message): boolean {
+  if (!message.guild || !message.member) {
+    return false;
+  }
+
+  return hasJoinRole(message.guild.id, message.member);
+}
+
+function commandListEmbed(message: Message): EmbedBuilder {
+  const joinRoleId = message.guild ? ticketConfigs.get(message.guild.id)?.joinRoleId : undefined;
+  const joinRole = joinRoleId ? `<@&${joinRoleId}>` : "Accepted Member role not configured";
+
   return new EmbedBuilder()
     .setColor(BRAND_PURPLE)
     .setTitle(`${BRAND_NAME} · Command Guide`)
-    .setDescription(commandListText())
-    .setFooter({ text: "New commands will appear here automatically." });
+    .setDescription("Commands are grouped by permission. Individual commands still enforce their own ticket/staff/admin requirements.")
+    .addFields(
+      {
+        name: "🛡️ Accepted Members",
+        value: [
+          `Required role: ${joinRole}`,
+          "`$cmd` / `$commands` — show this guide",
+          "`$temp` — toggle your configured temp mode",
+        ].join("\n"),
+      },
+      {
+        name: "🎫 Ticket Staff",
+        value: [
+          "`$claim` — claim a ticket",
+          "`$unclaim` — release a ticket",
+          "`$transfer @user` — transfer a ticket",
+          "`$add @user` — add someone to a ticket",
+          "`$remove @user` — remove someone from a ticket",
+          "`$close` / `$ticketclose` — close a ticket",
+          "`$tickettranscript` — save the transcript",
+          "`$mmhow` — post the middleman guide",
+          "`$conf` — post trade confirmation",
+          "`$fee` — post the fee panel",
+          "`$join` — post the Member verification panel (ticket claimer role or admin)",
+        ].join("\n"),
+      },
+      {
+        name: "⚙️ Administrators",
+        value: [
+          "`$ticketsetup` — configure claim + Accepted Member roles and publish the panel",
+          "`$ticketconfig` — update claim + Accepted Member roles",
+          "`$tempsetup @Role1 @Role2 ...` — configure temp roles",
+          "`$say` — send a plain or embed message as the bot",
+        ].join("\n"),
+      },
+      {
+        name: "🏆 Vouches",
+        value: [
+          "`$addvouch <amount> [@user]` — add vouches",
+          "`$vouches [@user]` — view vouches",
+          "`$removevouch [@user]` — reset vouches",
+        ].join("\n"),
+      },
+    )
+    .setFooter({ text: `${BRAND_NAME} · Organized command guide` });
 }
 
 function ticketHelpEmbed(): EmbedBuilder {
