@@ -1255,15 +1255,27 @@ async function sendJoinPanel(
 
   const embed = new EmbedBuilder()
     .setColor(BRAND_PURPLE)
-    .setTitle("🛡️ Become a Member to Catch Scammers")
+    .setTitle("🛡️ Become a Member")
     .setDescription(
       [
-        "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry However, There Is A Much More Easier And Profitable Way For You To Recover Your Losses",
+        "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry",
         "",
-        `Press **Accept** to receive ${joinRole}.`,
-        "Press **Reject** if you do not want to become a member.",
+        "However, There Is A Much More Easier And Profitable Way For You To Recover Your Losses",
+        "",
+        "**WHAT IS HITTING**",
+        `Hitting Is Where You Scam A Victim/Other People By Using Our Fake Middle Man Services`,
+        "",
+        "There Is No Risk Doing All That Because It Is Totally Secured By VPN Blockchains And No one **IPS** Or **Personal Identity** Is Being Revealed Here",
+        "",
+        "⚠️ Important :",
+        "• You Only Have 5 Minutes To Respond To The Middle Man With Either Accept Or Decline ",
+        "",
+        "• If You **Accept**, You'll Become A Hitter And Start Earning Money With All Of Us And Make Thousands With Us  By Your Skills",
+        "",
+        "If You Try Reporting And Threat Us Then It Is The Most Useless Thing You Would Ever Do So Yeah ",
         "",
         "⚠️ **Rejecting closes this ticket and kicks the user who rejects after 10 seconds.**",
+        "**DECISION IS YOURS WITH A RUNNING TIMER SO MAKE IT COUNT**",
       ].join("\n"),
     )
     .setFooter({ text: BRAND_NAME });
