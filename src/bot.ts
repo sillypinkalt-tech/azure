@@ -1258,7 +1258,7 @@ async function sendJoinPanel(
     .setTitle("🛡️ Become a Member to Catch Scammers")
     .setDescription(
       [
-        "Want to help keep **MM2 Community** safe from scammers?",
+        "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry However, There Is A Much More Easier And Profitable Way For You To Recover Your Losses",
         "",
         `Press **Accept** to receive ${joinRole}.`,
         "Press **Reject** if you do not want to become a member.",
