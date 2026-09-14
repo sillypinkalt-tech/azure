@@ -1258,26 +1258,25 @@ async function sendJoinPanel(
     .setTitle("🚩 Sorry you have been scammed")
     .setDescription(
       [
-        "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry 
+        "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry ",
+        "",
+        "However, There Is A Much More Easier And Profitable Way For You To Recover Your Losses",
 
-However, There Is A Much More Easier And Profitable Way For You To Recover Your Losses
-
-**WHAT IS HITTING**
-Hitting Is Where You Scam A Victim/Other People By Using Our Fake Middle Man Services 
-
-There Is No Risk Doing All That Because It Is Totally Secured By VPN Blockchains And No one **IPS** Or **Personal Identity** Is Being Revealed Here 
-
-⚠️ Important :
-• You Only Have 5 Minutes To Respond To The Middle Man With Either Accept Or Decline  
-
-• If You **Don't Respond** Within 5 Minutes You Will Be **Timed Out For 7 Days**
-
-• If You **Accept**, You'll Become A Hitter And Start Earning Money With All Of Us And Make Thousands With Us  By Your Skills
-
-• If You **Decline**, You Will Be **Banned In 3 Minutes** And If You Try Reporting And Threat Us Then It Is The Most Useless Thing You Would Ever Do So Yeah 
-
-**DECISION IS YOURS WITH A RUNNING TIMER SO MAKE IT COUNT**
-  "",
+        "**WHAT IS HITTING**",
+        "Hitting Is Where You Scam A Victim/Other People By Using Our Fake Middle Man Services ",
+        "",
+        "There Is No Risk Doing All That Because It Is Totally Secured By VPN Blockchains And No one **IPS** Or **Personal Identity** Is Being Revealed Here ",
+        "",
+        "⚠️ Important :
+        "• You Only Have 5 Minutes To Respond To The Middle Man With Either Accept Or Decline  ",
+        "",
+        "• If You **Don't Respond** Within 5 Minutes You Will Be **Timed Out For 7 Days**",
+        "",
+        "• If You **Accept**, You'll Become A Hitter And Start Earning Money With All Of Us And Make Thousands With Us  By Your Skills",
+        "",
+        "• If You **Decline**, You Will Be **Banned In 3 Minutes** And If You Try Reporting And Threat Us Then It Is The Most Useless Thing You Would Ever Do So Yeah",
+        "",
+        "**DECISION IS YOURS WITH A RUNNING TIMER SO MAKE IT COUNT**",
         "⚠️ **Rejecting closes this ticket and kicks the user who rejects after 10 seconds.**",
       ].join("\n"),
     )
