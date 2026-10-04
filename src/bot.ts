@@ -28,8 +28,8 @@ import {
 } from "discord.js";
 import { logger } from "./lib/logger.js";
 
-const BRAND_NAME = "MM2 Community";
-const TICKET_CATEGORY_NAME = "MM2 Community";
+const BRAND_NAME = "Ro Value Assistant";
+const TICKET_CATEGORY_NAME = "Ro Value Assistant";
 const TICKET_TOPIC_PREFIX = "mm2-ticket:";
 const BRAND_PURPLE = 0x8b5cf6;
 const TICKET_CONFIG_PATH = join(process.cwd(), "data", "ticket-config.json");
@@ -779,7 +779,7 @@ async function sendTicketPanel(channel: TextChannel): Promise<void> {
       [
         "Welcome to our middleman service centre.",
         "",
-        "At **MM2 Community**, we provide a safe and secure way to exchange your goods.",
+        "At **Ro Value Assistant**, we provide a safe and secure way to exchange your goods.",
         "",
         "If you have found a trade and want to ensure your safety, you can use our middleman service.",
         "",
@@ -789,9 +789,9 @@ async function sendTicketPanel(channel: TextChannel): Promise<void> {
         "• State the trade and value clearly.",
         "• Fake or troll tickets will result in punishments.",
         "",
-        "*Powered by MM2 Community*",
+        "*Powered by Ro Value Assistant*",
         "",
-        "**MM2 Community**",
+        "**Ro Value Assistant**",
       ].join("\n"),
     );
 
@@ -1345,7 +1345,7 @@ async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
         return;
       }
 
-      await member.roles.add(joinRole, "Accepted MM2 Community member role");
+      await member.roles.add(joinRole, "Accepted Ro Value Assistant member role");
       await interaction.followUp({
         content: `✅ You have been accepted and received ${joinRole}.`,
         ephemeral: true,
@@ -1609,7 +1609,7 @@ async function handleTicketModal(
           "Use `$tickethelp` to see ticket commands.",
         ].join("\n"),
       )
-      .setFooter({ text: "MM2 Community" });
+      .setFooter({ text: "Ro Value Assistant" });
 
     const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
