@@ -32,6 +32,24 @@ const BRAND_NAME = "Ro Value Assistant";
 const TICKET_CATEGORY_NAME = "Ro Value Assistant";
 const TICKET_TOPIC_PREFIX = "mm2-ticket:";
 const BRAND_PURPLE = 0x8b5cf6;
+const UI_PRIMARY = 0x6366f1;
+const UI_SUCCESS = 0x22c55e;
+const UI_DANGER = 0xef4444;
+const UI_WARNING = 0xf59e0b;
+
+function noticeEmbed(color: number, title: string, description: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setColor(color)
+    .setAuthor(brandAuthor())
+    .setTitle(title)
+    .setDescription(description)
+    .setTimestamp();
+}
+
+function brandAuthor(): { name: string; iconURL?: string } {
+  const iconURL = client?.user?.displayAvatarURL();
+  return iconURL ? { name: BRAND_NAME, iconURL } : { name: BRAND_NAME };
+}
 const TICKET_CONFIG_PATH = join(process.cwd(), "data", "ticket-config.json");
 
 const TICKET_COMMAND_GUIDE = [
@@ -427,8 +445,10 @@ async function configureTempRole(message: Message): Promise<void> {
     allowedMentions: { parse: [] },
     embeds: [
       new EmbedBuilder()
-        .setColor(BRAND_PURPLE)
-        .setTitle(`${BRAND_NAME} · Temp Roles Updated`)
+        .setColor(UI_SUCCESS)
+        .setAuthor(brandAuthor())
+        .setTitle("✅ Temp Roles Updated")
+        .setTimestamp()
         .setDescription(`Members who use \`$temp\` must already have all of these roles and will keep them while their other removable roles are removed: ${roles.join(" ")}.`)
         .setFooter({ text: "Run $tempsetup again anytime to replace the configured roles." }),
     ],
@@ -494,8 +514,10 @@ async function applyTempRole(message: Message): Promise<void> {
         allowedMentions: { parse: [] },
         embeds: [
           new EmbedBuilder()
-            .setColor(BRAND_PURPLE)
-            .setTitle(`${BRAND_NAME} · Temp Mode Removed`)
+            .setColor(UI_PRIMARY)
+            .setAuthor(brandAuthor())
+            .setTitle("🔄 Temp Mode Removed")
+            .setTimestamp()
             .setDescription("Your saved roles have been restored. Your configured temp roles are still kept.")
             .setFooter({ text: missingRoleCount > 0 ? `${missingRoleCount} saved role(s) no longer exist or could not be managed.` : "Use $temp again to apply temp mode." }),
         ],
@@ -515,8 +537,10 @@ async function applyTempRole(message: Message): Promise<void> {
       allowedMentions: { parse: [] },
       embeds: [
         new EmbedBuilder()
-          .setColor(BRAND_PURPLE)
-          .setTitle(`${BRAND_NAME} · Temp Mode Applied`)
+          .setColor(UI_SUCCESS)
+          .setAuthor(brandAuthor())
+          .setTitle("⚡ Temp Mode Applied")
+          .setTimestamp()
           .setDescription(`Your configured temp roles are being kept: ${tempRoles.join(" ")}.`)
           .setFooter({ text: skippedRoleCount > 0 ? `${skippedRoleCount} Discord-managed or higher roles could not be changed.` : "Use $temp again to restore your previous roles." }),
       ],
@@ -744,22 +768,21 @@ async function startTicketSetup(
     ? existingConfig.claimRoleIds.map((roleId) => `<@&${roleId}>`).join(" ")
     : "No claim roles saved yet.";
   const promptEmbed = new EmbedBuilder()
-    .setColor(BRAND_PURPLE)
-    .setTitle(`${BRAND_NAME} · ${mode === "setup" ? "Ticket Setup" : "Ticket Config"}`)
-    .setDescription(
-      [
-        "Please mention the roles that can claim tickets.",
-        "",
-        `**Current claim roles:** ${currentRoles}`,
-        "",
-        "You can mention one role or several roles in the next step.",
-      ].join("\n"),
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle(`🎫 ${mode === "setup" ? "Ticket Setup" : "Ticket Config"}`)
+    .setDescription("Choose which roles are allowed to claim and manage tickets.")
+    .addFields(
+      { name: "Current claim roles", value: currentRoles },
+      { name: "Next step", value: "Press the button below, then mention one role or several roles." },
     )
-    .setFooter({ text: "Only administrators can change this setting." });
+    .setFooter({ text: "Only administrators can change this setting." })
+    .setTimestamp();
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`ticket:roles:${mode}:${message.author.id}`)
       .setLabel(mode === "setup" ? "Set Claim Roles" : "Change Claim Roles")
+      .setEmoji("🛠️")
       .setStyle(ButtonStyle.Primary),
   );
 
@@ -772,28 +795,38 @@ async function startTicketSetup(
 }
 
 async function sendTicketPanel(channel: TextChannel): Promise<void> {
+  const avatar = client?.user?.displayAvatarURL();
   const panelEmbed = new EmbedBuilder()
-    .setColor(BRAND_PURPLE)
-    .setTitle(BRAND_NAME)
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle("🛡️ Middleman Service")
     .setDescription(
       [
         "Welcome to our middleman service centre.",
         "",
-        "At **Ro Value Assistant**, we provide a safe and secure way to exchange your goods.",
-        "",
+        `**${BRAND_NAME}** provides a safe and secure way to exchange your goods.`,
         "If you have found a trade and want to ensure your safety, you can use our middleman service.",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "**Usage Conditions:**",
-        "• Both parties agree to trade before requesting a middleman.",
-        "• State the trade and value clearly.",
-        "• Fake or troll tickets will result in punishments.",
-        "",
-        "*Powered by Ro Value Assistant*",
-        "",
-        "**Ro Value Assistant**",
       ].join("\n"),
-    );
+    )
+    .addFields(
+      {
+        name: "📌 Usage Conditions",
+        value: [
+          "> Both parties agree to trade before requesting a middleman.",
+          "> State the trade and value clearly.",
+          "> Fake or troll tickets will result in punishments.",
+        ].join("\n"),
+      },
+      {
+        name: "🚀 Getting Started",
+        value: "1️⃣ Press **Open Ticket** below\n2️⃣ Fill in the trade details\n3️⃣ A middleman will claim your ticket",
+      },
+    )
+    .setFooter({ text: `Powered by ${BRAND_NAME}`, ...(avatar ? { iconURL: avatar } : {}) })
+    .setTimestamp();
+  if (avatar) {
+    panelEmbed.setThumbnail(avatar);
+  }
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
@@ -871,8 +904,10 @@ async function saveRoleConfigFromModal(
       await interaction.editReply({
         embeds: [
           new EmbedBuilder()
-            .setColor(BRAND_PURPLE)
-            .setTitle(`${BRAND_NAME} · Role Setup`)
+            .setColor(UI_WARNING)
+            .setAuthor(brandAuthor())
+            .setTitle("⚠️ Role Setup")
+            .setTimestamp()
             .setDescription(
               "Please mention one or more valid server roles, for example `<@&123456789012345678>`, or paste the plain role ID.",
             ),
@@ -893,8 +928,10 @@ async function saveRoleConfigFromModal(
       await interaction.editReply({
         embeds: [
           new EmbedBuilder()
-            .setColor(BRAND_PURPLE)
-            .setTitle(`${BRAND_NAME} · Role Setup`)
+            .setColor(UI_WARNING)
+            .setAuthor(brandAuthor())
+            .setTitle("⚠️ Role Setup")
+            .setTimestamp()
             .setDescription(
               "One or more claim roles could not be found in this server. Please double-check the role mention or ID and try again.",
             ),
@@ -907,8 +944,10 @@ async function saveRoleConfigFromModal(
       await interaction.editReply({
         embeds: [
           new EmbedBuilder()
-            .setColor(BRAND_PURPLE)
-            .setTitle(`${BRAND_NAME} · Role Setup`)
+            .setColor(UI_WARNING)
+            .setAuthor(brandAuthor())
+            .setTitle("⚠️ Role Setup")
+            .setTimestamp()
             .setDescription("Please mention exactly one valid Accepted Member role."),
         ],
       });
@@ -925,8 +964,10 @@ async function saveRoleConfigFromModal(
       await interaction.editReply({
         embeds: [
           new EmbedBuilder()
-            .setColor(BRAND_PURPLE)
-            .setTitle(`${BRAND_NAME} · Role Setup`)
+            .setColor(UI_WARNING)
+            .setAuthor(brandAuthor())
+            .setTitle("⚠️ Role Setup")
+            .setTimestamp()
             .setDescription(
               "The Accepted Member role must be a normal role that I can manage. Move my highest role above it and try again.",
             ),
@@ -940,8 +981,10 @@ async function saveRoleConfigFromModal(
     const roleMentions = config.claimRoleIds.map((roleId) => `<@&${roleId}>`).join(" ");
     const needsTranscriptChannel = !config.transcriptChannelId;
     const successEmbed = new EmbedBuilder()
-      .setColor(BRAND_PURPLE)
-      .setTitle(`${BRAND_NAME} · ${mode === "setup" ? "Setup Complete" : "Config Updated"}`)
+      .setColor(UI_SUCCESS)
+      .setAuthor(brandAuthor())
+      .setTitle(`✅ ${mode === "setup" ? "Setup Complete" : "Config Updated"}`)
+      .setTimestamp()
       .setDescription(
         [
           `Allowed claim roles: ${roleMentions}`,
@@ -1002,8 +1045,10 @@ async function handleTranscriptChannelSelect(
     await saveTranscriptChannelConfig(interaction.guild.id, selectedChannelId);
 
     const confirmEmbed = new EmbedBuilder()
-      .setColor(BRAND_PURPLE)
-      .setTitle(`${BRAND_NAME} · Transcript Channel Set`)
+      .setColor(UI_SUCCESS)
+      .setAuthor(brandAuthor())
+      .setTitle("📜 Transcript Channel Set")
+      .setTimestamp()
       .setDescription(
         [
           `Ticket transcripts will be logged to <#${selectedChannelId}>.`,
@@ -1178,7 +1223,7 @@ async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
       }
 
       if (style === "embed") {
-        const embed = new EmbedBuilder().setColor(BRAND_PURPLE).setDescription(draft.content);
+        const embed = new EmbedBuilder().setColor(UI_PRIMARY).setDescription(draft.content);
         if (draft.title) {
           embed.setTitle(draft.title);
         }
@@ -1596,41 +1641,46 @@ async function handleTicketModal(
     });
 
     const ticketEmbed = new EmbedBuilder()
-      .setColor(BRAND_PURPLE)
-      .setTitle(`${BRAND_NAME} · Ticket`)
+      .setColor(UI_PRIMARY)
+      .setAuthor(brandAuthor())
+      .setTitle("🎫 New Middleman Ticket")
       .setDescription(
-        [
-          `Welcome <@${interaction.user.id}>. A middleman will be with you shortly.`,
-          "",
-          `**Other trader**\n${otherTrader}`,
-          "",
-          `**Trade details**\n${trade}`,
-          "",
-          "Use `$tickethelp` to see ticket commands.",
-        ].join("\n"),
+        `Welcome <@${interaction.user.id}>! A middleman will be with you shortly.\nPlease stay in this channel until your trade is complete.`,
       )
-      .setFooter({ text: "Ro Value Assistant" });
+      .addFields(
+        { name: "👤 Opened by", value: `<@${interaction.user.id}>`, inline: true },
+        { name: "🤝 Other trader", value: otherTrader.slice(0, 1024) || "—", inline: true },
+        { name: "💱 Trade details", value: trade.slice(0, 1024) || "—" },
+        { name: "💡 Need help?", value: "Use `$tickethelp` to see ticket commands." },
+      )
+      .setFooter({ text: BRAND_NAME })
+      .setTimestamp();
 
     const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId("ticket:claim")
         .setLabel("Claim")
+        .setEmoji("🙋")
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
         .setCustomId("ticket:unclaim")
         .setLabel("Unclaim")
+        .setEmoji("🔓")
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("ticket:transcript")
         .setLabel("Transcript")
+        .setEmoji("📄")
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("ticket:close")
         .setLabel("Close")
+        .setEmoji("🔒")
         .setStyle(ButtonStyle.Danger),
       new ButtonBuilder()
         .setCustomId("ticket:help")
         .setLabel("Help")
+        .setEmoji("❓")
         .setStyle(ButtonStyle.Primary),
     );
 
@@ -1677,7 +1727,15 @@ async function claimTicket(
   await channel.permissionOverwrites.set(
     buildClaimedTicketOverwrites(channel.guild, nextTicket),
   );
-  await channel.send(`Ticket claimed by <@${claimerId}>. Only the ticket owner, assigned staff member, and administrators can view it.`);
+  await channel.send({
+    embeds: [
+      noticeEmbed(
+        UI_SUCCESS,
+        "🙋 Ticket Claimed",
+        `Ticket claimed by <@${claimerId}>. Only the ticket owner, assigned staff member, and administrators can view it.`,
+      ),
+    ],
+  });
   await replyToActor(actor, `You are now handling ${channel}.`);
 }
 
@@ -1704,7 +1762,15 @@ async function unclaimTicket(
   await channel.permissionOverwrites.set(
     buildUnclaimedTicketOverwrites(channel.guild, nextTicket),
   );
-  await channel.send(`Ticket released by <@${getActorId(actor)}>. It is available for another staff member to claim.`);
+  await channel.send({
+    embeds: [
+      noticeEmbed(
+        UI_WARNING,
+        "🔓 Ticket Released",
+        `Ticket released by <@${getActorId(actor)}>. It is available for another staff member to claim.`,
+      ),
+    ],
+  });
   await replyToActor(actor, "The ticket is available again.");
 }
 
@@ -1743,7 +1809,16 @@ async function transferTicket(
   await channel.permissionOverwrites.set(
     buildClaimedTicketOverwrites(channel.guild, nextTicket),
   );
-  await channel.send(`Ticket transferred to <@${target.id}> by <@${message.author.id}>.`);
+  await channel.send({
+    content: `<@${target.id}>`,
+    embeds: [
+      noticeEmbed(
+        UI_PRIMARY,
+        "🔁 Ticket Transferred",
+        `Ticket transferred to <@${target.id}> by <@${message.author.id}>.`,
+      ),
+    ],
+  });
   await message.react("✅");
 }
 
@@ -1772,7 +1847,9 @@ async function closeTicket(
 
   const nextTicket = { ...ticket, state: "closed" as const };
 
-  await channel.send(`🔒 Ticket is being closed by <@${getActorId(actor)}>...`);
+  await channel.send({
+    embeds: [noticeEmbed(UI_DANGER, "🔒 Ticket Closing", `Ticket is being closed by <@${getActorId(actor)}>...`)],
+  });
 
   // permissionOverwrites uses a separate, much more generous rate limit
   // bucket than name/topic edits, so this is safe to do immediately.
@@ -1877,7 +1954,10 @@ async function addTicketMember(
   await updateTicket(channel, nextTicket);
   await channel.permissionOverwrites.set(buildOverwritesForState(channel.guild, nextTicket));
 
-  await message.reply(`<@${member.id}> was added to the ticket.`);
+  await message.reply({
+    content: `<@${member.id}>`,
+    embeds: [noticeEmbed(UI_SUCCESS, "➕ Member Added", `<@${member.id}> was added to the ticket.`)],
+  });
 }
 
 async function removeTicketMember(
@@ -1917,7 +1997,9 @@ async function removeTicketMember(
   await updateTicket(channel, nextTicket);
   await channel.permissionOverwrites.set(buildOverwritesForState(channel.guild, nextTicket));
 
-  await message.reply(`<@${member.id}> was removed from the ticket.`);
+  await message.reply({
+    embeds: [noticeEmbed(UI_DANGER, "➖ Member Removed", `<@${member.id}> was removed from the ticket.`)],
+  });
 }
 
 function buildOverwritesForState(guild: Guild, ticket: TicketMetadata): OverwriteResolvable[] {
@@ -1941,33 +2023,23 @@ async function sendMiddlemanHowTo(message: Message, channel: TextChannel): Promi
   }
 
   const embed = new EmbedBuilder()
-    .setColor(BRAND_PURPLE)
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
     .setTitle("🪙 How the Middleman Process Works")
-    .setDescription(
-      [
-        "A Middleman (MM) secures high-value trades so neither side gets scammed 🛡️",
-        "",
-        "📋 **Trade Agreement**",
-        "Both parties agree on the exact terms of the deal in a private channel or group.",
-        "",
-        "🔐 **Handing Over the Asset**",
-        "The seller hands over the item/account credentials to the official Middleman.",
-        "",
-        "🔍 **Securing the Goods**",
-        "The Middleman verifies that the item or account is valid and holds it safely.",
-        "",
-        "💸 **Sending Payment**",
-        "The buyer sends the agreed-upon payment directly to the seller.",
-        "",
-        "🎁 **Releasing the Asset**",
-        "Once the seller confirms the payment is received, the Middleman transfers the item/account to the buyer.",
-      ].join("\n"),
+    .setDescription("A Middleman (MM) secures high-value trades so neither side gets scammed 🛡️")
+    .addFields(
+      { name: "1️⃣ 📋 Trade Agreement", value: "Both parties agree on the exact terms of the deal in a private channel or group." },
+      { name: "2️⃣ 🔐 Handing Over the Asset", value: "The seller hands over the item/account credentials to the official Middleman." },
+      { name: "3️⃣ 🔍 Securing the Goods", value: "The Middleman verifies that the item or account is valid and holds it safely." },
+      { name: "4️⃣ 💸 Sending Payment", value: "The buyer sends the agreed-upon payment directly to the seller." },
+      { name: "5️⃣ 🎁 Releasing the Asset", value: "Once the seller confirms the payment is received, the Middleman transfers the item/account to the buyer." },
     )
-    .setFooter({ text: BRAND_NAME });
+    .setFooter({ text: BRAND_NAME })
+    .setTimestamp();
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("mm:understand:yes").setLabel("I Understand").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("mm:understand:no").setLabel("I Don't Understand").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("mm:understand:yes").setLabel("I Understand").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("mm:understand:no").setLabel("I Don't Understand").setEmoji("❓").setStyle(ButtonStyle.Danger),
   );
 
   try {
@@ -1986,21 +2058,20 @@ async function sendTradeConfirmationPanel(message: Message, channel: TextChannel
   }
 
   const embed = new EmbedBuilder()
-    .setColor(BRAND_PURPLE)
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
     .setTitle("📋 Confirmations")
-    .setDescription(
-      [
-        "Do both users confirm the trade?",
-        "",
-        "**Press Confirm** if you confirm.",
-        "**Press Decline** if you do not confirm.",
-      ].join("\n"),
+    .setDescription("**Do both users confirm the trade?**")
+    .addFields(
+      { name: "✅ Confirm", value: "Press **Confirm** if you confirm.", inline: true },
+      { name: "❌ Decline", value: "Press **Decline** if you do not confirm.", inline: true },
     )
-    .setFooter({ text: BRAND_NAME });
+    .setFooter({ text: BRAND_NAME })
+    .setTimestamp();
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("mm:confirm:yes").setLabel("Confirm").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("mm:confirm:no").setLabel("Decline").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("mm:confirm:yes").setLabel("Confirm").setEmoji("✅").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("mm:confirm:no").setLabel("Decline").setEmoji("❌").setStyle(ButtonStyle.Danger),
   );
 
   await channel.send({ embeds: [embed], components: [row] });
@@ -2012,23 +2083,23 @@ async function sendMiddlemanFeePanel(message: Message, channel: TextChannel): Pr
   }
 
   const embed = new EmbedBuilder()
-    .setColor(BRAND_PURPLE)
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle("🔒 Assets Secured")
     .setDescription(
-      [
-        "# 🔒 Assets Secured",
-        "The middleman is holding the items safely in escrow 🛡️. Please send the fee now so we can verify it and release the items! 🚀",
-        "",
-        "# Why We Charge Fees?",
-        "Fees keep the server running smoothly 🪂 pay for our custom bots ⚙️",
-        "and compensate our Trusted Middlemans",
-        "for securing your trade without scams!",
-      ].join("\n"),
+      "The middleman is holding the items safely in escrow 🛡️. Please send the fee now so we can verify it and release the items! 🚀",
     )
-    .setFooter({ text: BRAND_NAME });
+    .addFields({
+      name: "💰 Why We Charge Fees?",
+      value:
+        "Fees keep the server running smoothly 🪂, pay for our custom bots ⚙️ and compensate our Trusted Middlemans for securing your trade without scams!",
+    })
+    .setFooter({ text: BRAND_NAME })
+    .setTimestamp();
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("mm:fee:50").setLabel("Pay 50%").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("mm:fee:100").setLabel("Pay 100%").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("mm:fee:50").setLabel("Pay 50%").setEmoji("💳").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("mm:fee:100").setLabel("Pay 100%").setEmoji("💎").setStyle(ButtonStyle.Success),
   );
 
   await channel.send({ embeds: [embed], components: [row] });
@@ -2038,8 +2109,10 @@ async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Pr
   if (interaction.customId.startsWith("mm:understand:")) {
     const understood = interaction.customId.endsWith(":yes");
     const embed = new EmbedBuilder()
-      .setColor(understood ? SUCCESS_GREEN : DANGER_RED)
-      .setTitle(understood ? "User Confirmed Understanding" : "User Does NOT Understand")
+      .setColor(understood ? UI_SUCCESS : UI_DANGER)
+      .setAuthor({ name: interaction.user.username, iconURL: interaction.user.displayAvatarURL() })
+      .setTimestamp()
+      .setTitle(understood ? "✅ User Confirmed Understanding" : "❓ User Does NOT Understand")
       .setDescription(
         understood
           ? `<@${interaction.user.id}> understands how the Middleman works.`
@@ -2052,8 +2125,10 @@ async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Pr
   if (interaction.customId.startsWith("mm:confirm:")) {
     const confirmed = interaction.customId.endsWith(":yes");
     const embed = new EmbedBuilder()
-      .setColor(confirmed ? SUCCESS_GREEN : DANGER_RED)
-      .setTitle(confirmed ? "Trade Confirmed" : "Trade Declined")
+      .setColor(confirmed ? UI_SUCCESS : UI_DANGER)
+      .setAuthor({ name: interaction.user.username, iconURL: interaction.user.displayAvatarURL() })
+      .setTimestamp()
+      .setTitle(confirmed ? "✅ Trade Confirmed" : "❌ Trade Declined")
       .setDescription(
         confirmed
           ? `<@${interaction.user.id}> confirmed the trade.`
@@ -2066,8 +2141,10 @@ async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Pr
   if (interaction.customId.startsWith("mm:fee:")) {
     const isFullFee = interaction.customId.endsWith(":100");
     const embed = new EmbedBuilder()
-      .setColor(isFullFee ? SUCCESS_GREEN : BRAND_PURPLE)
-      .setTitle(isFullFee ? "100% Fee Chosen" : "50% Fee Chosen")
+      .setColor(isFullFee ? UI_SUCCESS : UI_PRIMARY)
+      .setAuthor({ name: interaction.user.username, iconURL: interaction.user.displayAvatarURL() })
+      .setTimestamp()
+      .setTitle(isFullFee ? "💎 100% Fee Chosen" : "💳 50% Fee Chosen")
       .setDescription(
         isFullFee
           ? `<@${interaction.user.id}> has chosen to pay the full fee.`
@@ -2097,9 +2174,19 @@ async function handleAddVouch(message: Message, args: string[]): Promise<void> {
 
   const newTotal = await addVouches(message.guild.id, target.id, amount);
   const isSelf = target.id === message.author.id;
-  await message.reply(
-    `✅ Added ${amount} vouches. ${isSelf ? "You now have" : `<@${target.id}> now has`} ${newTotal} vouches.`,
-  );
+  await message.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(UI_SUCCESS)
+        .setAuthor(brandAuthor())
+        .setTitle("✅ Vouches Added")
+        .setDescription(
+          `Added **${amount}** vouches. ${isSelf ? "You now have" : `<@${target.id}> now has`} **${newTotal}** vouches.`,
+        )
+        .setThumbnail(target.user.displayAvatarURL())
+        .setTimestamp(),
+    ],
+  });
 }
 
 async function handleVouchesCommand(message: Message): Promise<void> {
@@ -2115,8 +2202,11 @@ async function handleVouchesCommand(message: Message): Promise<void> {
 
   const count = getVouchCount(message.guild.id, target.id);
   const embed = new EmbedBuilder()
-    .setColor(SUCCESS_GREEN)
-    .setDescription(`**${target.displayName}** currently has ${count} vouches.`)
+    .setColor(UI_SUCCESS)
+    .setAuthor(brandAuthor())
+    .setTitle("🏆 Vouch Count")
+    .setDescription(`**${target.displayName}** currently has **${count}** vouches.`)
+    .addFields({ name: "Total vouches", value: `${count}`, inline: true })
     .setThumbnail(target.user.displayAvatarURL())
     .setFooter({ text: `Vouch Count • ${BRAND_NAME}` })
     .setTimestamp();
@@ -2136,7 +2226,17 @@ async function handleRemoveVouch(message: Message): Promise<void> {
 
   await resetVouches(message.guild.id, target.id);
   const isSelf = target.id === message.author.id;
-  await message.reply(`✅ Removed all ${isSelf ? "your" : `<@${target.id}>'s`} vouches.`);
+  await message.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(UI_DANGER)
+        .setAuthor(brandAuthor())
+        .setTitle("🗑️ Vouches Removed")
+        .setDescription(`Removed all ${isSelf ? "your" : `<@${target.id}>'s`} vouches.`)
+        .setThumbnail(target.user.displayAvatarURL())
+        .setTimestamp(),
+    ],
+  });
 }
 
 async function sendTicketHelp(message: Message): Promise<void> {
@@ -2183,8 +2283,9 @@ function commandListEmbed(message: Message): EmbedBuilder {
   const joinRole = joinRoleId ? `<@&${joinRoleId}>` : "Accepted Member role not configured";
 
   return new EmbedBuilder()
-    .setColor(BRAND_PURPLE)
-    .setTitle(`${BRAND_NAME} · Command Guide`)
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle("📖 Command Guide")
     .setDescription("Commands are grouped by permission. Individual commands still enforce their own ticket/staff/admin requirements.")
     .addFields(
       {
@@ -2229,13 +2330,15 @@ function commandListEmbed(message: Message): EmbedBuilder {
         ].join("\n"),
       },
     )
-    .setFooter({ text: `${BRAND_NAME} · Organized command guide` });
+    .setFooter({ text: `${BRAND_NAME} · Organized command guide` })
+    .setTimestamp();
 }
 
 function ticketHelpEmbed(): EmbedBuilder {
   return new EmbedBuilder()
-    .setColor(BRAND_PURPLE)
-    .setTitle(`${BRAND_NAME} · Ticket Commands`)
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle("🎫 Ticket Commands")
     .setDescription("Open tickets with the panel button, then use the commands below in a ticket channel.")
     .addFields(
       {
@@ -2266,7 +2369,8 @@ function ticketHelpEmbed(): EmbedBuilder {
         value: "`$ticketsetup` — configure roles and post the panel\n`$ticketconfig` — change claim roles later",
       },
     )
-    .setFooter({ text: "Keep ticket conversations inside the ticket channel." });
+    .setFooter({ text: "Keep ticket conversations inside the ticket channel." })
+    .setTimestamp();
 }
 
 function getTicketContext(
