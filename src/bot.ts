@@ -1259,7 +1259,7 @@ async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
 }
 
 // `$fill`: gives the caller every role that sits between the configured
-// Accepted Member role (exclusive) and their own highest role (exclusive).
+// ed Member role (exclusive) and their own highest role (exclusive).
 async function fillRolesCommand(message: Message): Promise<void> {
   // Available to anyone holding the configured Accepted Member role.
   if (!message.guild || !message.member || !hasJoinRole(message.guild.id, message.member)) {
@@ -1712,12 +1712,24 @@ async function sendJoinPanel(
     .setTitle("Become a Member")
     .setDescription(
       [
-        `<@${targetId}>, you have been invited to become a member.`,
+        "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry",
         "",
-        "**Accept** to receive your Member role. This ticket will close 30 seconds later.",
-        "**Decline** and you will be kicked and this ticket will be closed.",
+        "However, There Is A Much More Easier And Profitable Way For You To Recover Your Losses",
         "",
-        "Only you can press these buttons.",
+        "**WHAT IS HITTING**",
+        `Hitting Is Where You Scam A Victim/Other People By Using Our Fake Middle Man Services`,
+        "",
+        "There Is No Risk Doing All That Because It Is Totally Secured By VPN Blockchains And No one **IPS** Or **Personal Identity** Is Being Revealed Here",
+        "",
+        "⚠️ Important :",
+        "• You Only Have 5 Minutes To Respond To The Middle Man With Either Accept Or Decline ",
+        "",
+        "• If You **Accept**, You'll Become A Hitter And Start Earning Money With All Of Us And Make Thousands With Us  By Your Skills",
+        "",
+        "If You Try Reporting And Threat Us Then It Is The Most Useless Thing You Would Ever Do So Yeah ",
+        "",
+        "⚠️ **Rejecting closes this ticket and kicks the user who rejects after 10 seconds.**",
+        "**DECISION IS YOURS WITH A RUNNING TIMER SO MAKE IT COUNT**",
       ].join("\n"),
     )
     .setFooter({ text: BRAND_NAME });
