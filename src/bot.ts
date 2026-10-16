@@ -6,6 +6,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ChannelSelectMenuBuilder,
+  AuditLogEvent,
   ChannelType,
   Client,
   EmbedBuilder,
@@ -22,6 +23,7 @@ import {
   type ButtonInteraction,
   type ChannelSelectMenuInteraction,
   type Guild,
+  type GuildAuditLogsEntry,
   type GuildMember,
   type Message,
   type ModalSubmitInteraction,
@@ -80,6 +82,8 @@ const TEMP_COMMAND_GUIDE = [
 
 const ADMIN_COMMAND_GUIDE = [
   ["`$say`", "compose and send a message (plain or embed) as the bot in the current channel (administrators only)"],
+  ["`$addrole @user @role`", "add a role to a member (administrators only)"],
+  ["`$disablerole` / `$enablerole`", "block or allow manual role changes; while blocked, anyone who adds a role by hand is kicked (administrators only)"],
 ] as const;
 
 const VOUCH_COMMAND_GUIDE = [
@@ -109,6 +113,8 @@ type TicketConfig = {
   tempRoleId?: string;
   tempRoleBackups?: Record<string, string[]>;
   joinAnnouncement?: JoinAnnouncement;
+  // When true, roles added by hand (not through $addrole) are reverted and the person who added them is kicked.
+  manualRolesDisabled?: boolean;
   updatedAt: string;
 };
 
@@ -187,6 +193,8 @@ async function connectDiscordBot(): Promise<void> {
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
+      // Non-privileged intent that delivers audit log entries in real time.
+      GatewayIntentBits.GuildModeration,
     ],
   });
 
@@ -217,6 +225,10 @@ async function connectDiscordBot(): Promise<void> {
     if (interaction.isChannelSelectMenu()) {
       void handleTranscriptChannelSelect(interaction);
     }
+  });
+
+  nextClient.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
+    void handleRoleAuditEntry(entry, guild);
   });
 
   nextClient.on(Events.MessageCreate, (message) => {
@@ -634,6 +646,21 @@ async function handlePrefixCommand(message: Message): Promise<void> {
 
   if (command === "removevouch") {
     await handleRemoveVouch(message);
+    return;
+  }
+
+  if (command === "addrole") {
+    await addRoleCommand(message);
+    return;
+  }
+
+  if (command === "enablerole") {
+    await setManualRolePolicy(message, true);
+    return;
+  }
+
+  if (command === "disablerole") {
+    await setManualRolePolicy(message, false);
     return;
   }
 
@@ -1214,6 +1241,195 @@ async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
       logger.error({ err: error }, "Say send failed");
       await interaction.editReply({ content: "I couldn't send that message.", components: [] });
     }
+  }
+}
+
+async function addRoleCommand(message: Message): Promise<void> {
+  if (!message.guild || !message.member || !isAdministrator(message.member)) {
+    return;
+  }
+
+  const guild = message.guild;
+  const roles = await guild.roles.fetch();
+  const bareIds = [
+    ...message.content.replace(/<[@#][!&]?\d+>/g, "").matchAll(/\b\d{15,25}\b/g),
+  ].map((match) => match[0]);
+  const roleId = message.content.match(/<@&(\d+)>/)?.[1] ?? bareIds.find((id) => roles.has(id));
+  const userId =
+    message.content.match(/<@!?(\d+)>/)?.[1] ??
+    bareIds.find((id) => id !== roleId && !roles.has(id));
+
+  const reply = (color: number, title: string, description: string) =>
+    message.reply({
+      allowedMentions: { parse: [], repliedUser: false },
+      embeds: [noticeEmbed(color, title, description)],
+    });
+
+  if (!userId || !roleId) {
+    await reply(UI_WARNING, "Add Role", "Use `$addrole @user @role` or `$addrole @user role_id`.");
+    return;
+  }
+
+  const role = roles.get(roleId);
+  if (!role) {
+    await reply(UI_WARNING, "Add Role", "That role could not be found in this server.");
+    return;
+  }
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) {
+    await reply(UI_WARNING, "Add Role", "That member could not be found in this server.");
+    return;
+  }
+
+  if (role.id === guild.roles.everyone.id || role.managed) {
+    await reply(UI_WARNING, "Add Role", "Choose a regular server role, not @everyone or an integration-managed role.");
+    return;
+  }
+
+  if (!role.editable) {
+    await reply(UI_WARNING, "Add Role", `I cannot manage ${role}. Move my highest role above it and try again.`);
+    return;
+  }
+
+  if (
+    message.author.id !== guild.ownerId &&
+    role.position >= message.member.roles.highest.position
+  ) {
+    await reply(UI_WARNING, "Add Role", `You cannot assign ${role} because it is at or above your highest role.`);
+    return;
+  }
+
+  if (member.roles.cache.has(role.id)) {
+    await reply(UI_WARNING, "Add Role", `<@${member.id}> already has ${role}.`);
+    return;
+  }
+
+  try {
+    await member.roles.add(role, `$addrole used by ${message.author.tag}`);
+    await reply(UI_SUCCESS, "Role Added", `${role} was added to <@${member.id}> by <@${message.author.id}>.`);
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id, userId }, "$addrole failed");
+    await reply(UI_DANGER, "Add Role Failed", "I could not add that role. Please check my permissions and role position.");
+  }
+}
+
+async function setManualRolePolicy(message: Message, manualAllowed: boolean): Promise<void> {
+  if (!message.guild || !message.member || !isAdministrator(message.member)) {
+    return;
+  }
+
+  await updateTicketConfig(message.guild.id, { manualRolesDisabled: !manualAllowed });
+
+  if (manualAllowed) {
+    await message.reply({
+      allowedMentions: { parse: [], repliedUser: false },
+      embeds: [
+        noticeEmbed(
+          UI_PRIMARY,
+          "Manual Role Changes Enabled",
+          "Members with the right permissions may add roles manually. `$addrole` also continues to work.",
+        ),
+      ],
+    });
+    return;
+  }
+
+  const me = await message.guild.members.fetchMe().catch(() => null);
+  const missing = [
+    [PermissionFlagsBits.ViewAuditLog, "View Audit Log"],
+    [PermissionFlagsBits.KickMembers, "Kick Members"],
+    [PermissionFlagsBits.ManageRoles, "Manage Roles"],
+  ]
+    .filter(([permission]) => !me?.permissions.has(permission as bigint))
+    .map(([, label]) => label as string);
+
+  const embed = noticeEmbed(
+    UI_DANGER,
+    "Manual Role Changes Disabled",
+    "Roles must now be added with `$addrole`. If anyone adds a role manually, the role is removed again and the person who added it is kicked. The server owner and bots are exempt.",
+  );
+  if (missing.length > 0) {
+    embed.addFields({
+      name: "Missing bot permissions",
+      value: `${missing.join(", ")}. Grant these or the protection will not work fully.`,
+    });
+  }
+  await message.reply({ allowedMentions: { parse: [], repliedUser: false }, embeds: [embed] });
+}
+
+async function handleRoleAuditEntry(entry: GuildAuditLogsEntry, guild: Guild): Promise<void> {
+  try {
+    if (entry.action !== AuditLogEvent.MemberRoleUpdate) {
+      return;
+    }
+    if (!ticketConfigs.get(guild.id)?.manualRolesDisabled) {
+      return;
+    }
+
+    const executorId = entry.executorId;
+    const botId = guild.client.user?.id;
+    if (!executorId || executorId === botId || executorId === guild.ownerId) {
+      return;
+    }
+
+    const addedRoleIds = entry.changes
+      .filter((change) => change.key === "$add")
+      .flatMap((change) => ((change.new ?? []) as unknown as Array<{ id: string }>).map((role) => role.id));
+    if (addedRoleIds.length === 0) {
+      return;
+    }
+
+    const executor = await guild.members.fetch(executorId).catch(() => null);
+    if (!executor || executor.user.bot) {
+      return;
+    }
+
+    // Undo the manual change first, then remove the person who made it.
+    let reverted = false;
+    if (entry.targetId) {
+      const target = await guild.members.fetch(entry.targetId).catch(() => null);
+      const revertable = addedRoleIds.filter((roleId) => guild.roles.cache.get(roleId)?.editable);
+      if (target && revertable.length > 0) {
+        reverted = await target.roles
+          .remove(revertable, "Manual role change reverted (use $addrole)")
+          .then(() => true)
+          .catch((error) => {
+            logger.error({ err: error, guildId: guild.id }, "Could not revert manual role change");
+            return false;
+          });
+      }
+    }
+
+    let kicked = false;
+    let kickError = "";
+    if (executor.kickable) {
+      kicked = await executor
+        .kick("Added a role manually while manual role changes are disabled")
+        .then(() => true)
+        .catch((error) => {
+          kickError = error instanceof Error ? error.message : "Unknown error";
+          return false;
+        });
+    } else {
+      kickError = "Their highest role is at or above mine.";
+    }
+
+    const logChannel = await getTranscriptLogChannel(guild).catch(() => null);
+    if (logChannel) {
+      const embed = noticeEmbed(
+        kicked ? UI_DANGER : UI_WARNING,
+        "Manual Role Change Detected",
+        `<@${executorId}> added ${addedRoleIds.map((id) => `<@&${id}>`).join(" ")} to ${entry.targetId ? `<@${entry.targetId}>` : "a member"} without using \`$addrole\`.`,
+      ).addFields(
+        { name: "Role change reverted", value: reverted ? "Yes" : "No", inline: true },
+        { name: "Member kicked", value: kicked ? "Yes" : `No${kickError ? ` (${kickError})` : ""}`, inline: true },
+      );
+      await logChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => undefined);
+    }
+    logger.warn({ guildId: guild.id, executorId, addedRoleIds, reverted, kicked, kickError }, "Manual role change handled");
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id }, "Role audit entry handling failed");
   }
 }
 
@@ -2777,6 +2993,9 @@ function commandListEmbed(message: Message): EmbedBuilder {
           "`$joinsetup` — configure the announcement posted when a member accepts `$join`",
           "`$tempsetup @Role1 @Role2 ...` — configure temp roles",
           "`$say` — send a plain or embed message as the bot",
+          "`$addrole @user @role` — add a role to a member",
+          "`$disablerole` — block manual role changes (kicks whoever adds roles by hand)",
+          "`$enablerole` — allow manual role changes again",
         ].join("\n"),
       },
       {
