@@ -12,6 +12,7 @@ import {
   Events,
   GatewayIntentBits,
   ModalBuilder,
+  OverwriteType,
   PermissionFlagsBits,
   PermissionsBitField,
   REST,
@@ -21,9 +22,11 @@ import {
   type ButtonInteraction,
   type ChannelSelectMenuInteraction,
   type Guild,
+  type GuildMember,
   type Message,
   type ModalSubmitInteraction,
   type OverwriteResolvable,
+  type Role,
   type TextChannel,
 } from "discord.js";
 import { logger } from "./lib/logger.js";
@@ -57,8 +60,8 @@ const TICKET_COMMAND_GUIDE = [
   ["`$claim`", "claim the current ticket (configured staff roles or administrators)"],
   ["`$unclaim`", "release the current ticket (configured staff roles or administrators)"],
   ["`$transfer @user`", "transfer the ticket to another configured staff member"],
-  ["`$add @user`", "add someone to the current ticket (claim roles, admins, or the ticket owner)"],
-  ["`$remove @user`", "remove a previously added member from the current ticket"],
+  ["`$add @user`", "add one or more people to the current ticket, e.g. `$add @a @b @c` (claim roles, admins, or the ticket owner)"],
+  ["`$remove @user`", "remove one or more previously added members from the current ticket"],
   ["`$close` / `$ticketclose`", "close the current ticket, save its transcript, and delete it after 30 seconds (configured staff roles or administrators)"],
   ["`$tickettranscript`", "save and log the ticket conversation (configured staff roles or administrators)"],
   ["`$mmhow`", "post the Middleman info panel with I Understand / I Don't Understand buttons (configured staff roles or administrators)"],
@@ -66,6 +69,7 @@ const TICKET_COMMAND_GUIDE = [
   ["`$fee`", "post the middleman fee panel with Pay 50% / Pay 100% buttons (configured staff roles or administrators)"],
   ["`$join @user`", "post the Member Accept / Decline panel for the mentioned user; only they can press the buttons (configured ticket claimer roles or administrators)"],
   ["`$ticketconfig`", "change the ticket claim role and Accepted Member role (administrators only)"],
+  ["`$joinsetup`", "configure the channel and message the bot posts when a member accepts a `$join` offer (administrators only)"],
   ["`$tickethelp`", "show ticket commands only"],
 ] as const;
 
@@ -104,7 +108,14 @@ type TicketConfig = {
   tempRoleIds?: string[];
   tempRoleId?: string;
   tempRoleBackups?: Record<string, string[]>;
+  joinAnnouncement?: JoinAnnouncement;
   updatedAt: string;
+};
+
+type JoinAnnouncement = {
+  channelId: string;
+  title: string;
+  message: string;
 };
 
 const commandDefinitions: never[] = [];
@@ -246,72 +257,45 @@ async function loadTicketConfigs(): Promise<void> {
   }
 }
 
-async function saveTicketConfig(
+async function updateTicketConfig(
   guildId: string,
-  claimRoleIds: string[],
-  joinRoleId?: string,
+  patch: Partial<Omit<TicketConfig, "updatedAt">>,
 ): Promise<TicketConfig> {
   const existingConfig = ticketConfigs.get(guildId);
   const config: TicketConfig = {
-    claimRoleIds: [...new Set(claimRoleIds)],
-    ...(existingConfig?.transcriptChannelId
-      ? { transcriptChannelId: existingConfig.transcriptChannelId }
-      : {}),
-    ...(joinRoleId
-      ? { joinRoleId }
-      : existingConfig?.joinRoleId
-        ? { joinRoleId: existingConfig.joinRoleId }
-        : {}),
-    ...(existingConfig?.tempRoleIds ? { tempRoleIds: existingConfig.tempRoleIds } : {}),
-    ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
-    ...(existingConfig?.tempRoleBackups
-      ? { tempRoleBackups: existingConfig.tempRoleBackups }
-      : {}),
+    claimRoleIds: existingConfig?.claimRoleIds ?? [],
+    ...existingConfig,
+    ...patch,
     updatedAt: new Date().toISOString(),
   };
   ticketConfigs.set(guildId, config);
   await persistTicketConfigs();
   return config;
+}
+
+async function saveTicketConfig(
+  guildId: string,
+  claimRoleIds: string[],
+  joinRoleId?: string,
+): Promise<TicketConfig> {
+  return updateTicketConfig(guildId, {
+    claimRoleIds: [...new Set(claimRoleIds)],
+    ...(joinRoleId ? { joinRoleId } : {}),
+  });
 }
 
 async function saveTranscriptChannelConfig(
   guildId: string,
   transcriptChannelId: string,
 ): Promise<TicketConfig> {
-  const existingConfig = ticketConfigs.get(guildId);
-  const config: TicketConfig = {
-    claimRoleIds: existingConfig?.claimRoleIds ?? [],
-    ...(existingConfig?.joinRoleId ? { joinRoleId: existingConfig.joinRoleId } : {}),
-    transcriptChannelId,
-    ...(existingConfig?.tempRoleIds ? { tempRoleIds: existingConfig.tempRoleIds } : {}),
-    ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
-    ...(existingConfig?.tempRoleBackups
-      ? { tempRoleBackups: existingConfig.tempRoleBackups }
-      : {}),
-    updatedAt: new Date().toISOString(),
-  };
-  ticketConfigs.set(guildId, config);
-  await persistTicketConfigs();
-  return config;
+  return updateTicketConfig(guildId, { transcriptChannelId });
 }
 
 async function saveTempRoleConfig(
   guildId: string,
   tempRoleIds: string[],
 ): Promise<TicketConfig> {
-  const existingConfig = ticketConfigs.get(guildId);
-  const config: TicketConfig = {
-    claimRoleIds: existingConfig?.claimRoleIds ?? [],
-    ...(existingConfig?.joinRoleId ? { joinRoleId: existingConfig.joinRoleId } : {}),
-    tempRoleIds,
-    ...(existingConfig?.tempRoleBackups
-      ? { tempRoleBackups: existingConfig.tempRoleBackups }
-      : {}),
-    updatedAt: new Date().toISOString(),
-  };
-  ticketConfigs.set(guildId, config);
-  await persistTicketConfigs();
-  return config;
+  return updateTicketConfig(guildId, { tempRoleIds, tempRoleId: undefined });
 }
 
 async function saveTempRoleBackup(
@@ -320,22 +304,9 @@ async function saveTempRoleBackup(
   roleIds: string[],
 ): Promise<void> {
   const existingConfig = ticketConfigs.get(guildId);
-  const config: TicketConfig = {
-    claimRoleIds: existingConfig?.claimRoleIds ?? [],
-    ...(existingConfig?.joinRoleId ? { joinRoleId: existingConfig.joinRoleId } : {}),
-    ...(existingConfig?.transcriptChannelId
-      ? { transcriptChannelId: existingConfig.transcriptChannelId }
-      : {}),
-    ...(existingConfig?.tempRoleIds ? { tempRoleIds: existingConfig.tempRoleIds } : {}),
-    ...(existingConfig?.tempRoleId ? { tempRoleId: existingConfig.tempRoleId } : {}),
-    tempRoleBackups: {
-      ...(existingConfig?.tempRoleBackups ?? {}),
-      [userId]: roleIds,
-    },
-    updatedAt: new Date().toISOString(),
-  };
-  ticketConfigs.set(guildId, config);
-  await persistTicketConfigs();
+  await updateTicketConfig(guildId, {
+    tempRoleBackups: { ...(existingConfig?.tempRoleBackups ?? {}), [userId]: roleIds },
+  });
 }
 
 async function clearTempRoleBackup(
@@ -347,17 +318,10 @@ async function clearTempRoleBackup(
     return;
   }
 
-  const { [userId]: _removedBackup, ...remainingBackups } =
-    existingConfig.tempRoleBackups;
-  const config: TicketConfig = {
-    ...existingConfig,
-    ...(Object.keys(remainingBackups).length > 0
-      ? { tempRoleBackups: remainingBackups }
-      : { tempRoleBackups: undefined }),
-    updatedAt: new Date().toISOString(),
-  };
-  ticketConfigs.set(guildId, config);
-  await persistTicketConfigs();
+  const { [userId]: _removedBackup, ...remainingBackups } = existingConfig.tempRoleBackups;
+  await updateTicketConfig(guildId, {
+    tempRoleBackups: Object.keys(remainingBackups).length > 0 ? remainingBackups : undefined,
+  });
 }
 
 async function persistTicketConfigs(): Promise<void> {
@@ -447,7 +411,7 @@ async function configureTempRole(message: Message): Promise<void> {
       new EmbedBuilder()
         .setColor(UI_SUCCESS)
         .setAuthor(brandAuthor())
-        .setTitle("✅ Temp Roles Updated")
+        .setTitle("Temp Roles Updated")
         .setTimestamp()
         .setDescription(`Members who use \`$temp\` must already have all of these roles and will keep them while their other removable roles are removed: ${roles.join(" ")}.`)
         .setFooter({ text: "Run $tempsetup again anytime to replace the configured roles." }),
@@ -516,7 +480,7 @@ async function applyTempRole(message: Message): Promise<void> {
           new EmbedBuilder()
             .setColor(UI_PRIMARY)
             .setAuthor(brandAuthor())
-            .setTitle("🔄 Temp Mode Removed")
+            .setTitle("Temp Mode Removed")
             .setTimestamp()
             .setDescription("Your saved roles have been restored. Your configured temp roles are still kept.")
             .setFooter({ text: missingRoleCount > 0 ? `${missingRoleCount} saved role(s) no longer exist or could not be managed.` : "Use $temp again to apply temp mode." }),
@@ -539,7 +503,7 @@ async function applyTempRole(message: Message): Promise<void> {
         new EmbedBuilder()
           .setColor(UI_SUCCESS)
           .setAuthor(brandAuthor())
-          .setTitle("⚡ Temp Mode Applied")
+          .setTitle("Temp Mode Applied")
           .setTimestamp()
           .setDescription(`Your configured temp roles are being kept: ${tempRoles.join(" ")}.`)
           .setFooter({ text: skippedRoleCount > 0 ? `${skippedRoleCount} Discord-managed or higher roles could not be changed.` : "Use $temp again to restore your previous roles." }),
@@ -673,6 +637,11 @@ async function handlePrefixCommand(message: Message): Promise<void> {
     return;
   }
 
+  if (command === "joinsetup") {
+    await startJoinSetup(message);
+    return;
+  }
+
   if (command === "join") {
     // `$join @user`: only the mentioned user can press Accept / Decline.
     // With no mention at all, the command does nothing (no reply, no panel).
@@ -777,7 +746,7 @@ async function startTicketSetup(
   const promptEmbed = new EmbedBuilder()
     .setColor(UI_PRIMARY)
     .setAuthor(brandAuthor())
-    .setTitle(`🎫 ${mode === "setup" ? "Ticket Setup" : "Ticket Config"}`)
+    .setTitle(`${mode === "setup" ? "Ticket Setup" : "Ticket Config"}`)
     .setDescription("Choose which roles are allowed to claim and manage tickets.")
     .addFields(
       { name: "Current claim roles", value: currentRoles },
@@ -789,7 +758,7 @@ async function startTicketSetup(
     new ButtonBuilder()
       .setCustomId(`ticket:roles:${mode}:${message.author.id}`)
       .setLabel(mode === "setup" ? "Set Claim Roles" : "Change Claim Roles")
-      .setEmoji("🛠️")
+      
       .setStyle(ButtonStyle.Primary),
   );
 
@@ -806,7 +775,7 @@ async function sendTicketPanel(channel: TextChannel): Promise<void> {
   const panelEmbed = new EmbedBuilder()
     .setColor(UI_PRIMARY)
     .setAuthor(brandAuthor())
-    .setTitle("🛡️ Middleman Service")
+    .setTitle("Middleman Service")
     .setDescription(
       [
         "Welcome to our middleman service centre.",
@@ -817,7 +786,7 @@ async function sendTicketPanel(channel: TextChannel): Promise<void> {
     )
     .addFields(
       {
-        name: "📌 Usage Conditions",
+        name: "Usage Conditions",
         value: [
           "> Both parties agree to trade before requesting a middleman.",
           "> State the trade and value clearly.",
@@ -825,8 +794,8 @@ async function sendTicketPanel(channel: TextChannel): Promise<void> {
         ].join("\n"),
       },
       {
-        name: "🚀 Getting Started",
-        value: "1️⃣ Press **Open Ticket** below\n2️⃣ Fill in the trade details\n3️⃣ A middleman will claim your ticket",
+        name: "Getting Started",
+        value: "1. Press **Open Ticket** below\n2. Fill in the trade details\n3. A middleman will claim your ticket",
       },
     )
     .setFooter({ text: `Powered by ${BRAND_NAME}`, ...(avatar ? { iconURL: avatar } : {}) })
@@ -839,7 +808,7 @@ async function sendTicketPanel(channel: TextChannel): Promise<void> {
     new ButtonBuilder()
       .setCustomId("ticket:open")
       .setLabel("Open Ticket")
-      .setEmoji("🎟️")
+      
       .setStyle(ButtonStyle.Primary),
   );
 
@@ -913,7 +882,7 @@ async function saveRoleConfigFromModal(
           new EmbedBuilder()
             .setColor(UI_WARNING)
             .setAuthor(brandAuthor())
-            .setTitle("⚠️ Role Setup")
+            .setTitle("Role Setup")
             .setTimestamp()
             .setDescription(
               "Please mention one or more valid server roles, for example `<@&123456789012345678>`, or paste the plain role ID.",
@@ -937,7 +906,7 @@ async function saveRoleConfigFromModal(
           new EmbedBuilder()
             .setColor(UI_WARNING)
             .setAuthor(brandAuthor())
-            .setTitle("⚠️ Role Setup")
+            .setTitle("Role Setup")
             .setTimestamp()
             .setDescription(
               "One or more claim roles could not be found in this server. Please double-check the role mention or ID and try again.",
@@ -953,7 +922,7 @@ async function saveRoleConfigFromModal(
           new EmbedBuilder()
             .setColor(UI_WARNING)
             .setAuthor(brandAuthor())
-            .setTitle("⚠️ Role Setup")
+            .setTitle("Role Setup")
             .setTimestamp()
             .setDescription("Please mention exactly one valid Accepted Member role."),
         ],
@@ -973,7 +942,7 @@ async function saveRoleConfigFromModal(
           new EmbedBuilder()
             .setColor(UI_WARNING)
             .setAuthor(brandAuthor())
-            .setTitle("⚠️ Role Setup")
+            .setTitle("Role Setup")
             .setTimestamp()
             .setDescription(
               "The Accepted Member role must be a normal role that I can manage. Move my highest role above it and try again.",
@@ -990,7 +959,7 @@ async function saveRoleConfigFromModal(
     const successEmbed = new EmbedBuilder()
       .setColor(UI_SUCCESS)
       .setAuthor(brandAuthor())
-      .setTitle(`✅ ${mode === "setup" ? "Setup Complete" : "Config Updated"}`)
+      .setTitle(`${mode === "setup" ? "Setup Complete" : "Config Updated"}`)
       .setTimestamp()
       .setDescription(
         [
@@ -1054,7 +1023,7 @@ async function handleTranscriptChannelSelect(
     const confirmEmbed = new EmbedBuilder()
       .setColor(UI_SUCCESS)
       .setAuthor(brandAuthor())
-      .setTitle("📜 Transcript Channel Set")
+      .setTitle("Transcript Channel Set")
       .setTimestamp()
       .setDescription(
         [
@@ -1262,8 +1231,9 @@ async function syncOpenTicketPermissions(guild: Guild): Promise<void> {
       }
       const ticket = decodeTicketTopic(channel.topic);
       if (ticket?.state === "open") {
+        const synced = withLiveExtras(channel, ticket, [ticket.ownerId]);
         await channel.permissionOverwrites.set(
-          buildUnclaimedTicketOverwrites(guild, ticket),
+          buildUnclaimedTicketOverwrites(guild, synced),
         );
       }
     }),
@@ -1329,13 +1299,13 @@ async function sendJoinPanel(
 
   const embed = new EmbedBuilder()
     .setColor(BRAND_PURPLE)
-    .setTitle("🛡️ Become a Member")
+    .setTitle("Become a Member")
     .setDescription(
       [
         `<@${targetId}>, you have been invited to become a member.`,
         "",
-        "✅ **Accept** to receive your Member role. This ticket will close 30 seconds later.",
-        "❌ **Decline** and you will be kicked and this ticket will be closed.",
+        "**Accept** to receive your Member role. This ticket will close 30 seconds later.",
+        "**Decline** and you will be kicked and this ticket will be closed.",
         "",
         "Only you can press these buttons.",
       ].join("\n"),
@@ -1427,9 +1397,14 @@ async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
+  if (action !== "accept" && action !== "reject") {
+    return;
+  }
+
+  // The Member role is only needed when accepting. Declining must always work.
   const joinRoleId = ticketConfigs.get(guild.id)?.joinRoleId;
-  const joinRole = joinRoleId ? guild.roles.cache.get(joinRoleId) : null;
-  if (!joinRole || joinRole.managed || !joinRole.editable) {
+  const joinRole = joinRoleId ? guild.roles.cache.get(joinRoleId) : undefined;
+  if (action === "accept" && (!joinRole || joinRole.managed || !joinRole.editable)) {
     await interaction.reply({
       content: "The Accepted Member role is no longer available for me to manage.",
       ephemeral: true,
@@ -1437,25 +1412,27 @@ async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
-  const nextTicket = { ...ticket, state: "closed" as const };
+  // Lock the ticket first so a double click can't run this twice.
+  closingTicketChannelIds.add(channel.id);
+  await interaction.deferUpdate();
 
-  if (action === "accept") {
-    // Lock the ticket first so a double click can't run this twice.
-    closingTicketChannelIds.add(channel.id);
-    await interaction.deferUpdate();
+  const nextTicket = withLiveExtras(
+    channel,
+    { ...ticket, state: "closed" as const },
+    [ticket.ownerId, ticket.claimerId],
+  );
 
+  if (action === "accept" && joinRole) {
+    let member: GuildMember;
     try {
-      const member = await guild.members.fetch(interaction.user.id);
+      member = await guild.members.fetch(targetId);
       if (!member.roles.cache.has(joinRole.id)) {
-        await member.roles.add(joinRole, "Accepted Ro Value Assistant member role");
+        await member.roles.add(joinRole, "Accepted member offer");
       }
     } catch (error) {
       // Role could not be given, so keep the ticket open and let them retry.
       closingTicketChannelIds.delete(channel.id);
-      logger.error(
-        { err: error, guildId: guild.id, userId: interaction.user.id },
-        "Join role assignment failed",
-      );
+      logger.error({ err: error, guildId: guild.id, userId: targetId }, "Join role assignment failed");
       await interaction.followUp({
         content: "I couldn't give you the Member role. Please ask an administrator to check my role hierarchy.",
         ephemeral: true,
@@ -1463,27 +1440,26 @@ async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
       return;
     }
 
-    await interaction.message
-      .edit({ components: [buildDisabledJoinRow(targetId, channelId, "accept")] })
+    await interaction
+      .editReply({ components: [buildDisabledJoinRow(targetId, channelId, "accept")] })
       .catch(() => undefined);
 
-    await channel.send({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(SUCCESS_GREEN)
-          .setTitle("✅ Offer Accepted")
-          .setDescription(
-            `<@${targetId}> has accepted the offer and received ${joinRole}. This ticket will close in **30 seconds**.`,
-          )
-          .setFooter({ text: BRAND_NAME }),
-      ],
-    });
+    await channel
+      .send({
+        embeds: [
+          noticeEmbed(
+            UI_SUCCESS,
+            "Offer Accepted",
+            `<@${targetId}> accepted the offer and received ${joinRole}. This ticket will close in **30 seconds**.`,
+          ),
+        ],
+      })
+      .catch((error) => logger.error({ err: error }, "Could not send acceptance notice"));
 
-    await channel.permissionOverwrites
-      .set(buildClosedTicketOverwrites(guild, nextTicket))
-      .catch((error) => {
-        logger.error({ err: error, channelId: channel.id }, "Could not lock accepted ticket");
-      });
+    await Promise.allSettled([
+      channel.permissionOverwrites.set(buildClosedTicketOverwrites(guild, nextTicket)),
+      sendJoinAnnouncement(guild, member, joinRole, channel),
+    ]);
 
     scheduleJoinTicketCleanup(guild, channel, nextTicket, 30_000, {
       reason: "Member accepted - ticket closed",
@@ -1491,36 +1467,301 @@ async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
-  if (action === "reject") {
-    closingTicketChannelIds.add(channel.id);
-    await interaction.deferUpdate();
+  // Decline path
+  await interaction
+    .editReply({ components: [buildDisabledJoinRow(targetId, channelId, "decline")] })
+    .catch(() => undefined);
 
-    await interaction.message
-      .edit({ components: [buildDisabledJoinRow(targetId, channelId, "decline")] })
-      .catch(() => undefined);
-
-    await channel.send({
+  await channel
+    .send({
       embeds: [
-        new EmbedBuilder()
-          .setColor(DANGER_RED)
-          .setTitle("❌ Offer Declined")
-          .setDescription(
-            `<@${targetId}> declined the offer. They will be kicked and this ticket will close in **10 seconds**.`,
-          )
-          .setFooter({ text: BRAND_NAME }),
+        noticeEmbed(
+          UI_DANGER,
+          "Offer Declined",
+          `<@${targetId}> declined the offer. They will be removed from the server and this ticket will close in a few seconds.`,
+        ),
+      ],
+    })
+    .catch((error) => logger.error({ err: error }, "Could not send decline notice"));
+
+  await channel.permissionOverwrites
+    .set(buildClosedTicketOverwrites(guild, nextTicket))
+    .catch((error) => {
+      logger.error({ err: error, channelId: channel.id }, "Could not lock declined ticket");
+    });
+
+  scheduleJoinTicketCleanup(guild, channel, nextTicket, 5_000, {
+    kickUserId: targetId,
+    reason: "Declined member offer",
+  });
+}
+
+function renderJoinTemplate(template: string, values: Record<string, string>): string {
+  return template.replace(/\{(user|username|server|role|ticket)\}/gi, (_match, key: string) => {
+    return values[key.toLowerCase()] ?? "";
+  });
+}
+
+async function sendJoinAnnouncement(
+  guild: Guild,
+  member: GuildMember,
+  role: Role,
+  ticketChannel: TextChannel,
+): Promise<void> {
+  const announcement = ticketConfigs.get(guild.id)?.joinAnnouncement;
+  if (!announcement) {
+    return;
+  }
+
+  try {
+    const target = await guild.channels.fetch(announcement.channelId);
+    if (!target || !isTextChannel(target)) {
+      logger.warn({ guildId: guild.id, channelId: announcement.channelId }, "Join announcement channel unavailable");
+      return;
+    }
+
+    const values = {
+      user: `<@${member.id}>`,
+      username: member.user.username,
+      server: guild.name,
+      role: `<@&${role.id}>`,
+      ticket: ticketChannel.name,
+    };
+    const embed = new EmbedBuilder()
+      .setColor(UI_SUCCESS)
+      .setAuthor(brandAuthor())
+      .setDescription(renderJoinTemplate(announcement.message, values))
+      .setThumbnail(member.user.displayAvatarURL())
+      .setFooter({ text: BRAND_NAME })
+      .setTimestamp();
+    if (announcement.title) {
+      embed.setTitle(renderJoinTemplate(announcement.title, values).slice(0, 256));
+    }
+
+    await target.send({
+      content: `<@${member.id}>`,
+      embeds: [embed],
+      allowedMentions: { users: [member.id] },
+    });
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id }, "Join announcement failed");
+  }
+}
+
+async function startJoinSetup(message: Message): Promise<void> {
+  if (!message.member || !isAdministrator(message.member)) {
+    return;
+  }
+
+  if (!message.guild || !isTextChannel(message.channel)) {
+    await message.reply("This command can only be used in a server text channel.");
+    return;
+  }
+
+  const existing = ticketConfigs.get(message.guild.id)?.joinAnnouncement;
+  const embed = new EmbedBuilder()
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle("Join Announcement Setup")
+    .setDescription(
+      "Configure the message the bot posts when a member presses Accept on a `$join` offer. The accepted member is mentioned automatically.",
+    )
+    .addFields(
+      {
+        name: "Current channel",
+        value: existing ? `<#${existing.channelId}>` : "Not configured",
+        inline: true,
+      },
+      {
+        name: "Current title",
+        value: existing?.title ? existing.title.slice(0, 256) : "None",
+        inline: true,
+      },
+      {
+        name: "Current message",
+        value: existing ? existing.message.slice(0, 1000) : "Not configured",
+      },
+      {
+        name: "Available placeholders",
+        value: "`{user}` mention · `{username}` name · `{server}` server name · `{role}` accepted role · `{ticket}` ticket name",
+      },
+    )
+    .setFooter({ text: "Only administrators can change this setting." })
+    .setTimestamp();
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`joinsetup:open:${message.author.id}`)
+      .setLabel(existing ? "Edit Announcement" : "Configure Announcement")
+      .setStyle(ButtonStyle.Primary),
+  );
+
+  await message.reply({ embeds: [embed], components: [row], allowedMentions: { repliedUser: false } });
+}
+
+async function showJoinSetupModal(interaction: ButtonInteraction): Promise<void> {
+  const [, , adminId] = interaction.customId.split(":");
+  if (
+    !interaction.guild ||
+    !adminId ||
+    interaction.user.id !== adminId ||
+    !isAdministrator(interaction.member)
+  ) {
+    return;
+  }
+
+  const existing = ticketConfigs.get(interaction.guild.id)?.joinAnnouncement;
+
+  const channelInput = new TextInputBuilder()
+    .setCustomId("announce_channel")
+    .setLabel("Announcement channel")
+    .setPlaceholder("#channel mention or channel ID")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(100);
+  const titleInput = new TextInputBuilder()
+    .setCustomId("announce_title")
+    .setLabel("Title (optional)")
+    .setPlaceholder("Welcome to {server}")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(200);
+  const messageInput = new TextInputBuilder()
+    .setCustomId("announce_message")
+    .setLabel("Message")
+    .setPlaceholder("{user} has joined as {role}. Welcome to {server}.")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(1500);
+
+  if (existing) {
+    channelInput.setValue(existing.channelId);
+    if (existing.title) {
+      titleInput.setValue(existing.title.slice(0, 200));
+    }
+    messageInput.setValue(existing.message.slice(0, 1500));
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`joinsetup:modal:${adminId}`)
+    .setTitle("Join Announcement")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(channelInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(titleInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(messageInput),
+    );
+  await interaction.showModal(modal);
+}
+
+async function saveJoinSetupFromModal(interaction: ModalSubmitInteraction): Promise<void> {
+  try {
+    const [, , adminId] = interaction.customId.split(":");
+    if (
+      !interaction.guild ||
+      !adminId ||
+      interaction.user.id !== adminId ||
+      !isAdministrator(interaction.member)
+    ) {
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const channelRaw = interaction.fields.getTextInputValue("announce_channel");
+    const title = interaction.fields.getTextInputValue("announce_title").trim();
+    const messageText = interaction.fields.getTextInputValue("announce_message").trim();
+    const channelId =
+      channelRaw.match(/<#(\d+)>/)?.[1] ?? channelRaw.match(/\b(\d{15,25})\b/)?.[1];
+
+    const fail = async (description: string) => {
+      await interaction.editReply({
+        embeds: [noticeEmbed(UI_WARNING, "Join Announcement Setup", description)],
+      });
+    };
+
+    if (!channelId || !messageText) {
+      await fail("Please provide a valid channel (mention or ID) and a message.");
+      return;
+    }
+
+    const target = await interaction.guild.channels.fetch(channelId).catch(() => null);
+    if (!target || !isTextChannel(target)) {
+      await fail("That channel could not be found, or it is not a text channel.");
+      return;
+    }
+
+    const me = await interaction.guild.members.fetchMe().catch(() => null);
+    const canSend = me
+      ? target
+          .permissionsFor(me)
+          ?.has([
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.EmbedLinks,
+          ])
+      : false;
+    if (!canSend) {
+      await fail(`I need View Channel, Send Messages and Embed Links in ${target} before it can be used.`);
+      return;
+    }
+
+    await updateTicketConfig(interaction.guild.id, {
+      joinAnnouncement: { channelId: target.id, title, message: messageText },
+    });
+
+    await interaction.editReply({
+      embeds: [
+        noticeEmbed(UI_SUCCESS, "Join Announcement Saved", "This is now used whenever a member accepts a `$join` offer.").addFields(
+          { name: "Channel", value: `${target}`, inline: true },
+          { name: "Title", value: title || "None", inline: true },
+          { name: "Message", value: messageText.slice(0, 1000) },
+        ),
       ],
     });
+  } catch (error) {
+    await reportInteractionError(interaction, error, "Join announcement save failed");
+  }
+}
 
-    await channel.permissionOverwrites
-      .set(buildClosedTicketOverwrites(guild, nextTicket))
-      .catch((error) => {
-        logger.error({ err: error, channelId: channel.id }, "Could not lock declined ticket");
-      });
+async function kickDeclinedMember(
+  guild: Guild,
+  channel: TextChannel,
+  userId: string,
+  reason: string,
+): Promise<void> {
+  try {
+    const me = await guild.members.fetchMe();
+    if (!me.permissions.has(PermissionFlagsBits.KickMembers)) {
+      throw new Error("I do not have the Kick Members permission.");
+    }
 
-    scheduleJoinTicketCleanup(guild, channel, nextTicket, 10_000, {
-      kickUserId: targetId,
-      reason: "Declined Member offer",
-    });
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (!member) {
+      return; // Already left the server.
+    }
+    if (!member.kickable) {
+      throw new Error("The member's highest role is at or above my highest role, or they are the server owner.");
+    }
+
+    await member.kick(reason);
+    await channel
+      .send({
+        embeds: [noticeEmbed(UI_DANGER, "Member Removed", `<@${userId}> has been removed from the server.`)],
+      })
+      .catch(() => undefined);
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id, userId }, "Declined user kick failed");
+    const detail = error instanceof Error ? error.message : "Unknown error";
+    await channel
+      .send({
+        embeds: [
+          noticeEmbed(
+            UI_WARNING,
+            "Removal Failed",
+            `I could not remove <@${userId}> from the server.\n${detail}`,
+          ),
+        ],
+      })
+      .catch(() => undefined);
   }
 }
 
@@ -1533,37 +1774,34 @@ function scheduleJoinTicketCleanup(
   delayMs: number,
   options: { kickUserId?: string; reason: string },
 ): void {
-  setTimeout(async () => {
+  setTimeout(() => {
+    void runJoinTicketCleanup(guild, channel, ticket, options);
+  }, delayMs);
+}
+
+async function runJoinTicketCleanup(
+  guild: Guild,
+  channel: TextChannel,
+  ticket: TicketMetadata,
+  options: { kickUserId?: string; reason: string },
+): Promise<void> {
+  try {
+    if (options.kickUserId) {
+      await kickDeclinedMember(guild, channel, options.kickUserId, options.reason);
+    }
+
     try {
       await saveTicketTranscript(channel, ticket);
     } catch (error) {
       logger.error({ err: error, channelId: channel.id }, "Join ticket transcript save failed");
     }
-
-    if (options.kickUserId) {
-      try {
-        const member = await guild.members.fetch(options.kickUserId).catch(() => null);
-        if (member?.kickable) {
-          await member.kick(options.reason);
-        } else {
-          logger.warn(
-            { guildId: guild.id, userId: options.kickUserId },
-            "Declined user could not be kicked (missing member or role hierarchy)",
-          );
-        }
-      } catch (error) {
-        logger.error(
-          { err: error, guildId: guild.id, userId: options.kickUserId },
-          "Declined user kick failed",
-        );
-      }
-    }
-
+  } finally {
+    // The ticket is always deleted, even if the steps above failed.
     await channel.delete(options.reason).catch((error) => {
       logger.error({ err: error, channelId: channel.id }, "Failed to delete join ticket");
     });
     closingTicketChannelIds.delete(channel.id);
-  }, delayMs);
+  }
 }
 
 async function handleTicketButton(interaction: ButtonInteraction): Promise<void> {
@@ -1607,6 +1845,12 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
 
     if (interaction.customId.startsWith("join:")) {
       await handleJoinButton(interaction);
+      return;
+    }
+
+    if (interaction.customId.startsWith("joinsetup:open:")) {
+      // showModal() is the acknowledgement for this button.
+      await showJoinSetupModal(interaction);
       return;
     }
 
@@ -1697,6 +1941,11 @@ async function handleTicketModal(
     return;
   }
 
+  if (interaction.customId.startsWith("joinsetup:modal:")) {
+    await saveJoinSetupFromModal(interaction);
+    return;
+  }
+
   if (interaction.customId !== "ticket:create" || !interaction.guild) {
     return;
   }
@@ -1736,15 +1985,15 @@ async function handleTicketModal(
     const ticketEmbed = new EmbedBuilder()
       .setColor(UI_PRIMARY)
       .setAuthor(brandAuthor())
-      .setTitle("🎫 New Middleman Ticket")
+      .setTitle("New Middleman Ticket")
       .setDescription(
         `Welcome <@${interaction.user.id}>! A middleman will be with you shortly.\nPlease stay in this channel until your trade is complete.`,
       )
       .addFields(
-        { name: "👤 Opened by", value: `<@${interaction.user.id}>`, inline: true },
-        { name: "🤝 Other trader", value: otherTrader.slice(0, 1024) || "—", inline: true },
-        { name: "💱 Trade details", value: trade.slice(0, 1024) || "—" },
-        { name: "💡 Need help?", value: "Use `$tickethelp` to see ticket commands." },
+        { name: "Opened by", value: `<@${interaction.user.id}>`, inline: true },
+        { name: "Other trader", value: otherTrader.slice(0, 1024) || "—", inline: true },
+        { name: "Trade details", value: trade.slice(0, 1024) || "—" },
+        { name: "Need help?", value: "Use `$tickethelp` to see ticket commands." },
       )
       .setFooter({ text: BRAND_NAME })
       .setTimestamp();
@@ -1753,27 +2002,27 @@ async function handleTicketModal(
       new ButtonBuilder()
         .setCustomId("ticket:claim")
         .setLabel("Claim")
-        .setEmoji("🙋")
+        
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
         .setCustomId("ticket:unclaim")
         .setLabel("Unclaim")
-        .setEmoji("🔓")
+        
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("ticket:transcript")
         .setLabel("Transcript")
-        .setEmoji("📄")
+        
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId("ticket:close")
         .setLabel("Close")
-        .setEmoji("🔒")
+        
         .setStyle(ButtonStyle.Danger),
       new ButtonBuilder()
         .setCustomId("ticket:help")
         .setLabel("Help")
-        .setEmoji("❓")
+        
         .setStyle(ButtonStyle.Primary),
     );
 
@@ -1793,6 +2042,52 @@ async function handleTicketModal(
   } catch (error) {
     await reportInteractionError(interaction, error, "Ticket creation failed");
   }
+}
+
+// Added members live in the channel's permission overwrites, which can be
+// changed instantly. The ticket topic (rate limited by Discord) is only used
+// for claim state, so it is updated in the background.
+function liveExtraMemberIds(
+  channel: TextChannel,
+  exclude: Array<string | null | undefined>,
+): string[] {
+  const skip = new Set(exclude.filter((id): id is string => Boolean(id)));
+  const botId = channel.client.user?.id;
+  if (botId) {
+    skip.add(botId);
+  }
+  return [...channel.permissionOverwrites.cache.values()]
+    .filter((overwrite) => overwrite.type === OverwriteType.Member && !skip.has(overwrite.id))
+    .map((overwrite) => overwrite.id);
+}
+
+function withLiveExtras(
+  channel: TextChannel,
+  ticket: TicketMetadata,
+  exclude: Array<string | null | undefined>,
+): TicketMetadata {
+  return { ...ticket, additionalMemberIds: liveExtraMemberIds(channel, exclude) };
+}
+
+function persistTicketState(channel: TextChannel, ticket: TicketMetadata): Promise<void> {
+  return updateTicket(channel, ticket).catch((error) => {
+    logger.error({ err: error, channelId: channel.id }, "Ticket state could not be saved to the topic");
+  });
+}
+
+function collectTargetIds(message: Message): string[] {
+  const ids = new Set<string>();
+  for (const match of message.content.matchAll(/<@!?(\d+)>/g)) {
+    ids.add(match[1]);
+  }
+  const stripped = message.content
+    .replace(/<@&\d+>/g, "")
+    .replace(/<#\d+>/g, "")
+    .replace(/<@!?\d+>/g, "");
+  for (const match of stripped.matchAll(/\b\d{15,25}\b/g)) {
+    ids.add(match[0]);
+  }
+  return [...ids].slice(0, 25);
 }
 
 async function claimTicket(
@@ -1815,8 +2110,12 @@ async function claimTicket(
   }
 
   const claimerId = getActorId(actor);
-  const nextTicket = { ...ticket, state: "claimed" as const, claimerId };
-  await updateTicket(channel, nextTicket);
+  const nextTicket = withLiveExtras(
+    channel,
+    { ...ticket, state: "claimed" as const, claimerId },
+    [ticket.ownerId, claimerId],
+  );
+  const topicUpdate = persistTicketState(channel, nextTicket);
   await channel.permissionOverwrites.set(
     buildClaimedTicketOverwrites(channel.guild, nextTicket),
   );
@@ -1824,12 +2123,13 @@ async function claimTicket(
     embeds: [
       noticeEmbed(
         UI_SUCCESS,
-        "🙋 Ticket Claimed",
-        `Ticket claimed by <@${claimerId}>. Only the ticket owner, assigned staff member, and administrators can view it.`,
+        "Ticket Claimed",
+        `Ticket claimed by <@${claimerId}>. Only the ticket owner, assigned staff member, added members, and administrators can view it.`,
       ),
     ],
   });
   await replyToActor(actor, `You are now handling ${channel}.`);
+  await topicUpdate;
 }
 
 async function unclaimTicket(
@@ -1850,8 +2150,12 @@ async function unclaimTicket(
     return;
   }
 
-  const nextTicket = { ...ticket, state: "open" as const, claimerId: null };
-  await updateTicket(channel, nextTicket);
+  const nextTicket = withLiveExtras(
+    channel,
+    { ...ticket, state: "open" as const, claimerId: null },
+    [ticket.ownerId, ticket.claimerId],
+  );
+  const topicUpdate = persistTicketState(channel, nextTicket);
   await channel.permissionOverwrites.set(
     buildUnclaimedTicketOverwrites(channel.guild, nextTicket),
   );
@@ -1859,12 +2163,13 @@ async function unclaimTicket(
     embeds: [
       noticeEmbed(
         UI_WARNING,
-        "🔓 Ticket Released",
+        "Ticket Released",
         `Ticket released by <@${getActorId(actor)}>. It is available for another staff member to claim.`,
       ),
     ],
   });
   await replyToActor(actor, "The ticket is available again.");
+  await topicUpdate;
 }
 
 async function transferTicket(
@@ -1897,8 +2202,12 @@ async function transferTicket(
     return;
   }
 
-  const nextTicket = { ...ticket, state: "claimed" as const, claimerId: target.id };
-  await updateTicket(channel, nextTicket);
+  const nextTicket = withLiveExtras(
+    channel,
+    { ...ticket, state: "claimed" as const, claimerId: target.id },
+    [ticket.ownerId, ticket.claimerId, target.id],
+  );
+  const topicUpdate = persistTicketState(channel, nextTicket);
   await channel.permissionOverwrites.set(
     buildClaimedTicketOverwrites(channel.guild, nextTicket),
   );
@@ -1907,12 +2216,13 @@ async function transferTicket(
     embeds: [
       noticeEmbed(
         UI_PRIMARY,
-        "🔁 Ticket Transferred",
+        "Ticket Transferred",
         `Ticket transferred to <@${target.id}> by <@${message.author.id}>.`,
       ),
     ],
   });
   await message.react("✅");
+  await topicUpdate;
 }
 
 // Ticket state is persisted in the channel topic, which shares Discord's
@@ -1938,10 +2248,14 @@ async function closeTicket(
   }
   closingTicketChannelIds.add(channel.id);
 
-  const nextTicket = { ...ticket, state: "closed" as const };
+  const nextTicket = withLiveExtras(
+    channel,
+    { ...ticket, state: "closed" as const },
+    [ticket.ownerId, ticket.claimerId],
+  );
 
   await channel.send({
-    embeds: [noticeEmbed(UI_DANGER, "🔒 Ticket Closing", `Ticket is being closed by <@${getActorId(actor)}>...`)],
+    embeds: [noticeEmbed(UI_DANGER, "Ticket Closing", `Ticket is being closed by <@${getActorId(actor)}>...`)],
   });
 
   // permissionOverwrites uses a separate, much more generous rate limit
@@ -1960,8 +2274,8 @@ async function closeTicket(
   await replyToActor(
     actor,
     logChannel
-      ? `✅ Ticket closed. Transcript saved to ${logChannel}.`
-      : "✅ Ticket closed. Transcript could not be saved automatically.",
+      ? `Ticket closed. Transcript saved to ${logChannel}.`
+      : "Ticket closed. Transcript could not be saved automatically.",
   );
 
   await channel.delete("Ticket closed - automatic cleanup").catch((error) => {
@@ -2025,31 +2339,63 @@ async function addTicketMember(
     return;
   }
 
-  const member = message.mentions.members?.first();
-  if (!member) {
-    await message.reply("Use `$add @user` to add someone to this ticket.");
+  if (ticket.state === "closed" || closingTicketChannelIds.has(channel.id)) {
+    await message.reply("This ticket is already closed or closing.");
     return;
   }
 
-  if (
-    member.id === ticket.ownerId ||
-    member.id === ticket.claimerId ||
-    ticket.additionalMemberIds?.includes(member.id)
-  ) {
-    await message.reply(`<@${member.id}> already has access to this ticket.`);
+  const targetIds = collectTargetIds(message);
+  if (targetIds.length === 0) {
+    await message.reply("Use `$add @user @user ...` to add one or more people to this ticket.");
     return;
   }
 
-  const nextTicket: TicketMetadata = {
-    ...ticket,
-    additionalMemberIds: [...(ticket.additionalMemberIds ?? []), member.id],
-  };
-  await updateTicket(channel, nextTicket);
-  await channel.permissionOverwrites.set(buildOverwritesForState(channel.guild, nextTicket));
+  const addedIds: string[] = [];
+  const alreadyIds: string[] = [];
+  const failedIds: string[] = [];
+
+  // One permission overwrite per user, all sent in parallel. This does not
+  // touch the rate-limited channel topic, so it applies instantly.
+  await Promise.all(
+    targetIds.map(async (userId) => {
+      if (
+        userId === ticket.ownerId ||
+        userId === ticket.claimerId ||
+        channel.permissionOverwrites.cache.has(userId)
+      ) {
+        alreadyIds.push(userId);
+        return;
+      }
+      try {
+        await channel.permissionOverwrites.edit(userId, {
+          ViewChannel: true,
+          SendMessages: true,
+          ReadMessageHistory: true,
+        });
+        addedIds.push(userId);
+      } catch (error) {
+        logger.warn({ err: error, userId, channelId: channel.id }, "Could not add user to ticket");
+        failedIds.push(userId);
+      }
+    }),
+  );
+
+  const mention = (ids: string[]) => ids.map((id) => `<@${id}>`).join(" ");
+  const lines: string[] = [];
+  if (addedIds.length > 0) lines.push(`**Added:** ${mention(addedIds)}`);
+  if (alreadyIds.length > 0) lines.push(`**Already in ticket:** ${mention(alreadyIds)}`);
+  if (failedIds.length > 0) lines.push(`**Could not add:** ${mention(failedIds)}`);
 
   await message.reply({
-    content: `<@${member.id}>`,
-    embeds: [noticeEmbed(UI_SUCCESS, "➕ Member Added", `<@${member.id}> was added to the ticket.`)],
+    ...(addedIds.length > 0 ? { content: mention(addedIds) } : {}),
+    allowedMentions: { users: addedIds, repliedUser: false },
+    embeds: [
+      noticeEmbed(
+        addedIds.length > 0 ? UI_SUCCESS : UI_WARNING,
+        addedIds.length > 0 ? "Members Added" : "No Members Added",
+        lines.join("\n"),
+      ),
+    ],
   });
 }
 
@@ -2062,36 +2408,54 @@ async function removeTicketMember(
     return;
   }
 
-  const member = message.mentions.members?.first();
-  if (!member) {
-    await message.reply("Use `$remove @user` to remove someone from this ticket.");
+  const targetIds = collectTargetIds(message);
+  if (targetIds.length === 0) {
+    await message.reply("Use `$remove @user @user ...` to remove one or more people from this ticket.");
     return;
   }
 
-  if (member.id === ticket.ownerId) {
-    await message.reply("The ticket owner cannot be removed from their own ticket.");
-    return;
-  }
+  const removedIds: string[] = [];
+  const protectedIds: string[] = [];
+  const notAddedIds: string[] = [];
+  const failedIds: string[] = [];
 
-  if (member.id === ticket.claimerId) {
-    await message.reply("The current claimer cannot be removed. Use `$unclaim` or `$transfer` first.");
-    return;
-  }
+  await Promise.all(
+    targetIds.map(async (userId) => {
+      if (userId === ticket.ownerId || userId === ticket.claimerId) {
+        protectedIds.push(userId);
+        return;
+      }
+      const overwrite = channel.permissionOverwrites.cache.get(userId);
+      if (!overwrite || overwrite.type !== OverwriteType.Member) {
+        notAddedIds.push(userId);
+        return;
+      }
+      try {
+        await channel.permissionOverwrites.delete(userId);
+        removedIds.push(userId);
+      } catch (error) {
+        logger.warn({ err: error, userId, channelId: channel.id }, "Could not remove user from ticket");
+        failedIds.push(userId);
+      }
+    }),
+  );
 
-  if (!ticket.additionalMemberIds?.includes(member.id)) {
-    await message.reply(`<@${member.id}> was not added to this ticket.`);
-    return;
-  }
-
-  const nextTicket: TicketMetadata = {
-    ...ticket,
-    additionalMemberIds: ticket.additionalMemberIds.filter((id) => id !== member.id),
-  };
-  await updateTicket(channel, nextTicket);
-  await channel.permissionOverwrites.set(buildOverwritesForState(channel.guild, nextTicket));
+  const mention = (ids: string[]) => ids.map((id) => `<@${id}>`).join(" ");
+  const lines: string[] = [];
+  if (removedIds.length > 0) lines.push(`**Removed:** ${mention(removedIds)}`);
+  if (protectedIds.length > 0) lines.push(`**Cannot be removed (owner or claimer):** ${mention(protectedIds)}`);
+  if (notAddedIds.length > 0) lines.push(`**Not added to this ticket:** ${mention(notAddedIds)}`);
+  if (failedIds.length > 0) lines.push(`**Could not remove:** ${mention(failedIds)}`);
 
   await message.reply({
-    embeds: [noticeEmbed(UI_DANGER, "➖ Member Removed", `<@${member.id}> was removed from the ticket.`)],
+    allowedMentions: { parse: [], repliedUser: false },
+    embeds: [
+      noticeEmbed(
+        removedIds.length > 0 ? UI_DANGER : UI_WARNING,
+        removedIds.length > 0 ? "Members Removed" : "No Members Removed",
+        lines.join("\n"),
+      ),
+    ],
   });
 }
 
@@ -2118,21 +2482,21 @@ async function sendMiddlemanHowTo(message: Message, channel: TextChannel): Promi
   const embed = new EmbedBuilder()
     .setColor(UI_PRIMARY)
     .setAuthor(brandAuthor())
-    .setTitle("🪙 How the Middleman Process Works")
-    .setDescription("A Middleman (MM) secures high-value trades so neither side gets scammed 🛡️")
+    .setTitle("How the Middleman Process Works")
+    .setDescription("A Middleman (MM) secures high-value trades so that neither party is put at risk.")
     .addFields(
-      { name: "1️⃣ 📋 Trade Agreement", value: "Both parties agree on the exact terms of the deal in a private channel or group." },
-      { name: "2️⃣ 🔐 Handing Over the Asset", value: "The seller hands over the item/account credentials to the official Middleman." },
-      { name: "3️⃣ 🔍 Securing the Goods", value: "The Middleman verifies that the item or account is valid and holds it safely." },
-      { name: "4️⃣ 💸 Sending Payment", value: "The buyer sends the agreed-upon payment directly to the seller." },
-      { name: "5️⃣ 🎁 Releasing the Asset", value: "Once the seller confirms the payment is received, the Middleman transfers the item/account to the buyer." },
+      { name: "1. Trade Agreement", value: "Both parties agree on the exact terms of the deal in a private channel or group." },
+      { name: "2. Handing Over the Asset", value: "The seller hands over the item/account credentials to the official Middleman." },
+      { name: "3. Securing the Goods", value: "The Middleman verifies that the item or account is valid and holds it safely." },
+      { name: "4. Sending Payment", value: "The buyer sends the agreed-upon payment directly to the seller." },
+      { name: "5. Releasing the Asset", value: "Once the seller confirms the payment is received, the Middleman transfers the item/account to the buyer." },
     )
     .setFooter({ text: BRAND_NAME })
     .setTimestamp();
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mm:understand:yes").setLabel("I Understand").setEmoji("✅").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("mm:understand:no").setLabel("I Don't Understand").setEmoji("❓").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("mm:understand:no").setLabel("I Don't Understand").setStyle(ButtonStyle.Danger),
   );
 
   try {
@@ -2153,11 +2517,11 @@ async function sendTradeConfirmationPanel(message: Message, channel: TextChannel
   const embed = new EmbedBuilder()
     .setColor(UI_PRIMARY)
     .setAuthor(brandAuthor())
-    .setTitle("📋 Confirmations")
+    .setTitle("Confirmations")
     .setDescription("**Do both users confirm the trade?**")
     .addFields(
-      { name: "✅ Confirm", value: "Press **Confirm** if you confirm.", inline: true },
-      { name: "❌ Decline", value: "Press **Decline** if you do not confirm.", inline: true },
+      { name: "Confirm", value: "Press **Confirm** if you confirm.", inline: true },
+      { name: "Decline", value: "Press **Decline** if you do not confirm.", inline: true },
     )
     .setFooter({ text: BRAND_NAME })
     .setTimestamp();
@@ -2178,21 +2542,21 @@ async function sendMiddlemanFeePanel(message: Message, channel: TextChannel): Pr
   const embed = new EmbedBuilder()
     .setColor(UI_PRIMARY)
     .setAuthor(brandAuthor())
-    .setTitle("🔒 Assets Secured")
+    .setTitle("Assets Secured")
     .setDescription(
-      "The middleman is holding the items safely in escrow 🛡️. Please send the fee now so we can verify it and release the items! 🚀",
+      "Your items are being held securely in escrow by the middleman. Please send the agreed fee so it can be verified and your items released.",
     )
     .addFields({
-      name: "💰 Why We Charge Fees?",
+      name: "Why Fees Apply",
       value:
-        "Fees keep the server running smoothly 🪂, pay for our custom bots ⚙️ and compensate our Trusted Middlemans for securing your trade without scams!",
+        "Fees support server operations, cover the cost of our custom tooling, and compensate our trusted middlemen for securing your trade.",
     })
     .setFooter({ text: BRAND_NAME })
     .setTimestamp();
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("mm:fee:50").setLabel("Pay 50%").setEmoji("💳").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("mm:fee:100").setLabel("Pay 100%").setEmoji("💎").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("mm:fee:50").setLabel("Pay 50%").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("mm:fee:100").setLabel("Pay 100%").setStyle(ButtonStyle.Success),
   );
 
   await channel.send({ embeds: [embed], components: [row] });
@@ -2205,7 +2569,7 @@ async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Pr
       .setColor(understood ? UI_SUCCESS : UI_DANGER)
       .setAuthor({ name: interaction.user.username, iconURL: interaction.user.displayAvatarURL() })
       .setTimestamp()
-      .setTitle(understood ? "✅ User Confirmed Understanding" : "❓ User Does NOT Understand")
+      .setTitle(understood ? "User Confirmed Understanding" : "User Does NOT Understand")
       .setDescription(
         understood
           ? `<@${interaction.user.id}> understands how the Middleman works.`
@@ -2221,7 +2585,7 @@ async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Pr
       .setColor(confirmed ? UI_SUCCESS : UI_DANGER)
       .setAuthor({ name: interaction.user.username, iconURL: interaction.user.displayAvatarURL() })
       .setTimestamp()
-      .setTitle(confirmed ? "✅ Trade Confirmed" : "❌ Trade Declined")
+      .setTitle(confirmed ? "Trade Confirmed" : "Trade Declined")
       .setDescription(
         confirmed
           ? `<@${interaction.user.id}> confirmed the trade.`
@@ -2237,7 +2601,7 @@ async function handleMiddlemanWorkflowButton(interaction: ButtonInteraction): Pr
       .setColor(isFullFee ? UI_SUCCESS : UI_PRIMARY)
       .setAuthor({ name: interaction.user.username, iconURL: interaction.user.displayAvatarURL() })
       .setTimestamp()
-      .setTitle(isFullFee ? "💎 100% Fee Chosen" : "💳 50% Fee Chosen")
+      .setTitle(isFullFee ? "100% Fee Chosen" : "50% Fee Chosen")
       .setDescription(
         isFullFee
           ? `<@${interaction.user.id}> has chosen to pay the full fee.`
@@ -2272,7 +2636,7 @@ async function handleAddVouch(message: Message, args: string[]): Promise<void> {
       new EmbedBuilder()
         .setColor(UI_SUCCESS)
         .setAuthor(brandAuthor())
-        .setTitle("✅ Vouches Added")
+        .setTitle("Vouches Added")
         .setDescription(
           `Added **${amount}** vouches. ${isSelf ? "You now have" : `<@${target.id}> now has`} **${newTotal}** vouches.`,
         )
@@ -2297,7 +2661,7 @@ async function handleVouchesCommand(message: Message): Promise<void> {
   const embed = new EmbedBuilder()
     .setColor(UI_SUCCESS)
     .setAuthor(brandAuthor())
-    .setTitle("🏆 Vouch Count")
+    .setTitle("Vouch Count")
     .setDescription(`**${target.displayName}** currently has **${count}** vouches.`)
     .addFields({ name: "Total vouches", value: `${count}`, inline: true })
     .setThumbnail(target.user.displayAvatarURL())
@@ -2324,7 +2688,7 @@ async function handleRemoveVouch(message: Message): Promise<void> {
       new EmbedBuilder()
         .setColor(UI_DANGER)
         .setAuthor(brandAuthor())
-        .setTitle("🗑️ Vouches Removed")
+        .setTitle("Vouches Removed")
         .setDescription(`Removed all ${isSelf ? "your" : `<@${target.id}>'s`} vouches.`)
         .setThumbnail(target.user.displayAvatarURL())
         .setTimestamp(),
@@ -2378,11 +2742,11 @@ function commandListEmbed(message: Message): EmbedBuilder {
   return new EmbedBuilder()
     .setColor(UI_PRIMARY)
     .setAuthor(brandAuthor())
-    .setTitle("📖 Command Guide")
+    .setTitle("Command Guide")
     .setDescription("Commands are grouped by permission. Individual commands still enforce their own ticket/staff/admin requirements.")
     .addFields(
       {
-        name: "🛡️ Accepted Members",
+        name: "Accepted Members",
         value: [
           `Required role: ${joinRole}`,
           "`$cmd` / `$commands` — show this guide",
@@ -2390,13 +2754,13 @@ function commandListEmbed(message: Message): EmbedBuilder {
         ].join("\n"),
       },
       {
-        name: "🎫 Ticket Staff",
+        name: "Ticket Staff",
         value: [
           "`$claim` — claim a ticket",
           "`$unclaim` — release a ticket",
           "`$transfer @user` — transfer a ticket",
-          "`$add @user` — add someone to a ticket",
-          "`$remove @user` — remove someone from a ticket",
+          "`$add @user @user ...` — add one or more people to a ticket",
+          "`$remove @user @user ...` — remove one or more people from a ticket",
           "`$close` / `$ticketclose` — close a ticket",
           "`$tickettranscript` — save the transcript",
           "`$mmhow` — post the middleman guide",
@@ -2406,16 +2770,17 @@ function commandListEmbed(message: Message): EmbedBuilder {
         ].join("\n"),
       },
       {
-        name: "⚙️ Administrators",
+        name: "Administrators",
         value: [
           "`$ticketsetup` — configure claim + Accepted Member roles and publish the panel",
           "`$ticketconfig` — update claim + Accepted Member roles",
+          "`$joinsetup` — configure the announcement posted when a member accepts `$join`",
           "`$tempsetup @Role1 @Role2 ...` — configure temp roles",
           "`$say` — send a plain or embed message as the bot",
         ].join("\n"),
       },
       {
-        name: "🏆 Vouches",
+        name: "Vouches",
         value: [
           "`$addvouch <amount> [@user]` — add vouches",
           "`$vouches [@user]` — view vouches",
@@ -2431,7 +2796,7 @@ function ticketHelpEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setColor(UI_PRIMARY)
     .setAuthor(brandAuthor())
-    .setTitle("🎫 Ticket Commands")
+    .setTitle("Ticket Commands")
     .setDescription("Open tickets with the panel button, then use the commands below in a ticket channel.")
     .addFields(
       {
@@ -2441,7 +2806,7 @@ function ticketHelpEmbed(): EmbedBuilder {
       {
         name: "Ticket users",
         value: [
-          "`$add @user` — add someone to your ticket",
+          "`$add @user @user ...` — add one or more people to your ticket",
           "`$close` — close the ticket (configured staff roles/admins)",
         ].join("\n"),
       },
@@ -2451,15 +2816,15 @@ function ticketHelpEmbed(): EmbedBuilder {
           "`$claim` — claim the current ticket",
           "`$unclaim` — release the current ticket",
           "`$transfer @user` — transfer it to another configured staff member",
-          "`$add @user` — add someone to the ticket",
-          "`$remove @user` — remove a previously added member",
+          "`$add @user @user ...` — add one or more people to the ticket",
+          "`$remove @user @user ...` — remove previously added members",
           "`$close` — close and lock the ticket",
           "`$tickettranscript` — save and log the conversation",
         ].join("\n"),
       },
       {
         name: "Administrators",
-        value: "`$ticketsetup` — configure roles and post the panel\n`$ticketconfig` — change claim roles later",
+        value: "`$ticketsetup` — configure roles and post the panel\n`$ticketconfig` — change claim roles later\n`$joinsetup` — configure the member-accepted announcement",
       },
     )
     .setFooter({ text: "Keep ticket conversations inside the ticket channel." })
