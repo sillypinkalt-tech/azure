@@ -83,6 +83,7 @@ const TEMP_COMMAND_GUIDE = [
 const ADMIN_COMMAND_GUIDE = [
   ["`$say`", "compose and send a message (plain or embed) as the bot in the current channel (administrators only)"],
   ["`$addrole @user @role`", "add a role to a member (administrators only)"],
+  ["`$removerole @user @role`", "remove a role from a member (administrators only)"],
   ["`$fill`", "give yourself every role between the Accepted Member role and your highest role (Accepted Members only)"],
   ["`$disablerole` / `$enablerole`", "block or allow manual role changes; while blocked, anyone who adds a role by hand is kicked (administrators only)"],
 ] as const;
@@ -116,6 +117,8 @@ type TicketConfig = {
   joinAnnouncement?: JoinAnnouncement;
   // When true, roles added by hand (not through $addrole) are reverted and the person who added them is kicked.
   manualRolesDisabled?: boolean;
+  // Channel where role-guard alerts are posted (the channel $disablerole was run in).
+  roleAlertChannelId?: string;
   updatedAt: string;
 };
 
@@ -657,6 +660,11 @@ async function handlePrefixCommand(message: Message): Promise<void> {
 
   if (command === "addrole") {
     await addRoleCommand(message);
+    return;
+  }
+
+  if (command === "removerole") {
+    await removeRoleCommand(message);
     return;
   }
 
@@ -1324,6 +1332,76 @@ async function fillRolesCommand(message: Message): Promise<void> {
   await message.reply({ allowedMentions: { parse: [], repliedUser: false }, embeds: [embed] });
 }
 
+async function removeRoleCommand(message: Message): Promise<void> {
+  if (!message.guild || !message.member || !isAdministrator(message.member)) {
+    return;
+  }
+
+  const guild = message.guild;
+  const roles = await guild.roles.fetch();
+  const bareIds = [
+    ...message.content.replace(/<[@#][!&]?\d+>/g, "").matchAll(/\b\d{15,25}\b/g),
+  ].map((match) => match[0]);
+  const roleId = message.content.match(/<@&(\d+)>/)?.[1] ?? bareIds.find((id) => roles.has(id));
+  const userId =
+    message.content.match(/<@!?(\d+)>/)?.[1] ??
+    bareIds.find((id) => id !== roleId && !roles.has(id));
+
+  const reply = (color: number, title: string, description: string) =>
+    message.reply({
+      allowedMentions: { parse: [], repliedUser: false },
+      embeds: [noticeEmbed(color, title, description)],
+    });
+
+  if (!userId || !roleId) {
+    await reply(UI_WARNING, "Remove Role", "Use `$removerole @user @role` or `$removerole @user role_id`.");
+    return;
+  }
+
+  const role = roles.get(roleId);
+  if (!role) {
+    await reply(UI_WARNING, "Remove Role", "That role could not be found in this server.");
+    return;
+  }
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) {
+    await reply(UI_WARNING, "Remove Role", "That member could not be found in this server.");
+    return;
+  }
+
+  if (role.id === guild.roles.everyone.id || role.managed) {
+    await reply(UI_WARNING, "Remove Role", "Choose a regular server role, not @everyone or an integration-managed role.");
+    return;
+  }
+
+  if (!role.editable) {
+    await reply(UI_WARNING, "Remove Role", `I cannot manage ${role}. Move my highest role above it and try again.`);
+    return;
+  }
+
+  if (
+    message.author.id !== guild.ownerId &&
+    role.position >= message.member.roles.highest.position
+  ) {
+    await reply(UI_WARNING, "Remove Role", `You cannot remove ${role} because it is at or above your highest role.`);
+    return;
+  }
+
+  if (!member.roles.cache.has(role.id)) {
+    await reply(UI_WARNING, "Remove Role", `<@${member.id}> does not have ${role}.`);
+    return;
+  }
+
+  try {
+    await member.roles.remove(role, `$removerole used by ${message.author.tag}`);
+    await reply(UI_DANGER, "Role Removed", `${role} was removed from <@${member.id}> by <@${message.author.id}>.`);
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id, userId }, "$removerole failed");
+    await reply(UI_DANGER, "Remove Role Failed", "I could not remove that role. Please check my permissions and role position.");
+  }
+}
+
 async function addRoleCommand(message: Message): Promise<void> {
   if (!message.guild || !message.member || !isAdministrator(message.member)) {
     return;
@@ -1399,7 +1477,10 @@ async function setManualRolePolicy(message: Message, manualAllowed: boolean): Pr
     return;
   }
 
-  await updateTicketConfig(message.guild.id, { manualRolesDisabled: !manualAllowed });
+  await updateTicketConfig(message.guild.id, {
+    manualRolesDisabled: !manualAllowed,
+    ...(manualAllowed ? {} : { roleAlertChannelId: message.channel.id }),
+  });
 
   if (manualAllowed) {
     await message.reply({
@@ -1427,7 +1508,7 @@ async function setManualRolePolicy(message: Message, manualAllowed: boolean): Pr
   const embed = noticeEmbed(
     UI_DANGER,
     "Manual Role Changes Disabled",
-    "Roles must now be added with `$addrole`. If anyone adds a role manually, the role is removed again and the person who added it is kicked. The server owner and bots are exempt.",
+    "Roles must now be added with `$addrole`. If anyone adds a role manually, the role is removed again and the person who added it is kicked. Only the server owner and this bot are exempt. Alerts are posted in this channel.",
   );
   if (missing.length > 0) {
     embed.addFields({
@@ -1435,7 +1516,36 @@ async function setManualRolePolicy(message: Message, manualAllowed: boolean): Pr
       value: `${missing.join(", ")}. Grant these or the protection will not work fully.`,
     });
   }
+  if (me) {
+    const guildRef = message.guild;
+    const botTop = me.roles.highest;
+    const unkickable = [...guildRef.roles.cache.values()]
+      .filter((role) => role.id !== guildRef.id && !role.managed && role.position > botTop.position)
+      .sort((first, second) => second.position - first.position);
+    if (unkickable.length > 0) {
+      embed.addFields({
+        name: "Members I cannot kick",
+        value: `Anyone whose highest role is above mine cannot be kicked: ${unkickable.slice(0, 10).join(" ")}${unkickable.length > 10 ? " and more" : ""}. Move my role above them in Server Settings > Roles so everyone is covered.`,
+      });
+    }
+  }
   await message.reply({ allowedMentions: { parse: [], repliedUser: false }, embeds: [embed] });
+}
+
+async function getRoleAlertChannel(guild: Guild): Promise<TextChannel | null> {
+  const alertChannelId = ticketConfigs.get(guild.id)?.roleAlertChannelId;
+  if (alertChannelId) {
+    const channel = await guild.channels.fetch(alertChannelId).catch(() => null);
+    if (channel && isTextChannel(channel)) {
+      return channel;
+    }
+  }
+  const transcriptChannel = await getTranscriptLogChannel(guild).catch(() => null);
+  if (transcriptChannel) {
+    return transcriptChannel;
+  }
+  const systemChannel = guild.systemChannel;
+  return systemChannel && isTextChannel(systemChannel) ? systemChannel : null;
 }
 
 async function handleRoleAuditEntry(entry: GuildAuditLogsEntry, guild: Guild): Promise<void> {
@@ -1447,6 +1557,7 @@ async function handleRoleAuditEntry(entry: GuildAuditLogsEntry, guild: Guild): P
       return;
     }
 
+    // Everyone is covered except the server owner and this bot.
     const executorId = entry.executorId;
     const botId = guild.client.user?.id;
     if (!executorId || executorId === botId || executorId === guild.ownerId) {
@@ -1461,7 +1572,7 @@ async function handleRoleAuditEntry(entry: GuildAuditLogsEntry, guild: Guild): P
     }
 
     const executor = await guild.members.fetch(executorId).catch(() => null);
-    if (!executor || executor.user.bot) {
+    if (!executor) {
       return;
     }
 
@@ -1483,7 +1594,12 @@ async function handleRoleAuditEntry(entry: GuildAuditLogsEntry, guild: Guild): P
 
     let kicked = false;
     let kickError = "";
-    if (executor.kickable) {
+    const me = await guild.members.fetchMe().catch(() => null);
+    if (!me?.permissions.has(PermissionFlagsBits.KickMembers)) {
+      kickError = "I do not have the Kick Members permission.";
+    } else if (!executor.kickable) {
+      kickError = "Their highest role is at or above my highest role. Move my role above theirs.";
+    } else {
       kicked = await executor
         .kick("Added a role manually while manual role changes are disabled")
         .then(() => true)
@@ -1491,21 +1607,19 @@ async function handleRoleAuditEntry(entry: GuildAuditLogsEntry, guild: Guild): P
           kickError = error instanceof Error ? error.message : "Unknown error";
           return false;
         });
-    } else {
-      kickError = "Their highest role is at or above mine.";
     }
 
-    const logChannel = await getTranscriptLogChannel(guild).catch(() => null);
-    if (logChannel) {
+    const alertChannel = await getRoleAlertChannel(guild);
+    if (alertChannel) {
       const embed = noticeEmbed(
         kicked ? UI_DANGER : UI_WARNING,
         "Manual Role Change Detected",
         `<@${executorId}> added ${addedRoleIds.map((id) => `<@&${id}>`).join(" ")} to ${entry.targetId ? `<@${entry.targetId}>` : "a member"} without using \`$addrole\`.`,
       ).addFields(
         { name: "Role change reverted", value: reverted ? "Yes" : "No", inline: true },
-        { name: "Member kicked", value: kicked ? "Yes" : `No${kickError ? ` (${kickError})` : ""}`, inline: true },
+        { name: "Member kicked", value: kicked ? "Yes" : `No. ${kickError}`, inline: true },
       );
-      await logChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => undefined);
+      await alertChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => undefined);
     }
     logger.warn({ guildId: guild.id, executorId, addedRoleIds, reverted, kicked, kickError }, "Manual role change handled");
   } catch (error) {
@@ -3075,6 +3189,7 @@ function commandListEmbed(message: Message): EmbedBuilder {
           "`$tempsetup @Role1 @Role2 ...` — configure temp roles",
           "`$say` — send a plain or embed message as the bot",
           "`$addrole @user @role` — add a role to a member",
+          "`$removerole @user @role` — remove a role from a member",
           "`$disablerole` — block manual role changes (kicks whoever adds roles by hand)",
           "`$enablerole` — allow manual role changes again",
         ].join("\n"),
