@@ -64,7 +64,7 @@ const TICKET_COMMAND_GUIDE = [
   ["`$mmhow`", "post the Middleman info panel with I Understand / I Don't Understand buttons (configured staff roles or administrators)"],
   ["`$conf`", "post a trade confirmation panel with Confirm / Decline buttons (configured staff roles or administrators)"],
   ["`$fee`", "post the middleman fee panel with Pay 50% / Pay 100% buttons (configured staff roles or administrators)"],
-  ["`$join`", "post the Member / Scammer Catcher panel (configured ticket claimer roles or administrators)"],
+  ["`$join @user`", "post the Member Accept / Decline panel for the mentioned user; only they can press the buttons (configured ticket claimer roles or administrators)"],
   ["`$ticketconfig`", "change the ticket claim role and Accepted Member role (administrators only)"],
   ["`$tickethelp`", "show ticket commands only"],
 ] as const;
@@ -674,6 +674,13 @@ async function handlePrefixCommand(message: Message): Promise<void> {
   }
 
   if (command === "join") {
+    // `$join @user`: only the mentioned user can press Accept / Decline.
+    // With no mention at all, the command does nothing (no reply, no panel).
+    const targetId = message.content.match(/<@!?(\d+)>/)?.[1];
+    if (!targetId) {
+      return;
+    }
+
     const ticketContext = getTicketContext(message);
     if (!ticketContext) {
       await message.reply({
@@ -686,7 +693,7 @@ async function handlePrefixCommand(message: Message): Promise<void> {
       });
       return;
     }
-    await sendJoinPanel(message, ticketContext.channel, ticketContext.ticket);
+    await sendJoinPanel(message, ticketContext.channel, ticketContext.ticket, targetId);
     return;
   }
 
@@ -1267,12 +1274,13 @@ async function sendJoinPanel(
   message: Message,
   channel: TextChannel,
   ticket: TicketMetadata,
+  targetId: string,
 ): Promise<void> {
   if (!canClaimTicket(message)) {
     return;
   }
 
-  if (ticket.state === "closed") {
+  if (ticket.state === "closed" || closingTicketChannelIds.has(channel.id)) {
     await message.reply({
       embeds: [
         new EmbedBuilder()
@@ -1284,8 +1292,29 @@ async function sendJoinPanel(
     return;
   }
 
-  const joinRoleId = ticketConfigs.get(message.guild!.id)?.joinRoleId;
-  const joinRole = joinRoleId ? message.guild!.roles.cache.get(joinRoleId) : null;
+  const guild = message.guild!;
+
+  // The mentioned user must be a real (non-bot) member of this server.
+  const targetMember = await guild.members.fetch(targetId).catch(() => null);
+  if (!targetMember || targetMember.user.bot) {
+    return;
+  }
+
+  // The buttons are useless if the target can't even see the ticket.
+  if (!channel.permissionsFor(targetMember)?.has(PermissionFlagsBits.ViewChannel)) {
+    await message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(DANGER_RED)
+          .setTitle(`${BRAND_NAME} · User Not In Ticket`)
+          .setDescription("That user can't see this ticket yet. Add them with `$add @user` first."),
+      ],
+    });
+    return;
+  }
+
+  const joinRoleId = ticketConfigs.get(guild.id)?.joinRoleId;
+  const joinRole = joinRoleId ? guild.roles.cache.get(joinRoleId) : null;
   if (!joinRoleId || !joinRole) {
     await message.reply({
       embeds: [
@@ -1303,44 +1332,86 @@ async function sendJoinPanel(
     .setTitle("🛡️ Become a Member")
     .setDescription(
       [
-        "lol"
+        `<@${targetId}>, you have been invited to become a member.`,
+        "",
+        "✅ **Accept** to receive your Member role. This ticket will close 30 seconds later.",
+        "❌ **Decline** and you will be kicked and this ticket will be closed.",
+        "",
+        "Only you can press these buttons.",
       ].join("\n"),
     )
     .setFooter({ text: BRAND_NAME });
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(`join:accept:${ticket.ownerId}:${channel.id}`)
+      .setCustomId(`join:accept:${targetId}:${channel.id}`)
       .setLabel("Accept")
       .setEmoji("✅")
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
-      .setCustomId(`join:reject:${ticket.ownerId}:${channel.id}`)
-      .setLabel("Reject")
+      .setCustomId(`join:reject:${targetId}:${channel.id}`)
+      .setLabel("Decline")
       .setEmoji("❌")
       .setStyle(ButtonStyle.Danger),
   );
 
-  await channel.send({ embeds: [embed], components: [row] });
+  await channel.send({
+    content: `<@${targetId}>`,
+    embeds: [embed],
+    components: [row],
+    allowedMentions: { users: [targetId] },
+  });
   await message.reply({
     embeds: [
       new EmbedBuilder()
         .setColor(SUCCESS_GREEN)
         .setTitle(`${BRAND_NAME} · Member Panel Sent`)
-        .setDescription("The Accept / Reject panel has been posted in this ticket."),
+        .setDescription(`The Accept / Decline panel has been posted for <@${targetId}>.`),
     ],
   });
 }
 
+function buildDisabledJoinRow(
+  targetId: string,
+  channelId: string,
+  chosen: "accept" | "decline",
+): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`join:accept:${targetId}:${channelId}`)
+      .setLabel(chosen === "accept" ? "Accepted" : "Accept")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(true),
+    new ButtonBuilder()
+      .setCustomId(`join:reject:${targetId}:${channelId}`)
+      .setLabel(chosen === "decline" ? "Declined" : "Decline")
+      .setEmoji("❌")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(true),
+  );
+}
+
 async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
-  const [, action, ownerId, channelId] = interaction.customId.split(":");
-  if (!interaction.guild || !action || !ownerId || !channelId) {
+  // customId = join:<accept|reject>:<id of the user who was mentioned>:<ticket channel id>
+  const [, action, targetId, channelId] = interaction.customId.split(":");
+  const guild = interaction.guild;
+  if (!guild || !action || !targetId || !channelId) {
+    return;
+  }
+
+  // Only the user who was mentioned in `$join @user` may press these buttons.
+  if (interaction.user.id !== targetId) {
+    await interaction.reply({
+      content: `Only <@${targetId}> can use these buttons.`,
+      ephemeral: true,
+    });
     return;
   }
 
   const channel = getInteractionTextChannel(interaction);
   const ticket = channel ? decodeTicketTopic(channel.topic) : null;
-  if (!channel || !ticket || ticket.ownerId !== ownerId || channel.id !== channelId) {
+  if (!channel || !ticket || channel.id !== channelId) {
     await interaction.reply({
       content: "This Member panel is no longer connected to an active ticket.",
       ephemeral: true,
@@ -1348,13 +1419,16 @@ async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
-  if (ticket.state === "closed") {
-    await interaction.reply({ content: "This ticket is already closed.", ephemeral: true });
+  if (ticket.state === "closed" || closingTicketChannelIds.has(channel.id)) {
+    await interaction.reply({
+      content: "This ticket is already closed or closing.",
+      ephemeral: true,
+    });
     return;
   }
 
-  const joinRoleId = ticketConfigs.get(interaction.guild.id)?.joinRoleId;
-  const joinRole = joinRoleId ? interaction.guild.roles.cache.get(joinRoleId) : null;
+  const joinRoleId = ticketConfigs.get(guild.id)?.joinRoleId;
+  const joinRole = joinRoleId ? guild.roles.cache.get(joinRoleId) : null;
   if (!joinRole || joinRole.managed || !joinRole.editable) {
     await interaction.reply({
       content: "The Accepted Member role is no longer available for me to manage.",
@@ -1363,97 +1437,133 @@ async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
+  const nextTicket = { ...ticket, state: "closed" as const };
+
   if (action === "accept") {
+    // Lock the ticket first so a double click can't run this twice.
+    closingTicketChannelIds.add(channel.id);
     await interaction.deferUpdate();
 
     try {
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      if (member.roles.cache.has(joinRole.id)) {
-        await interaction.followUp({ content: `You already have ${joinRole}.`, ephemeral: true });
-        return;
+      const member = await guild.members.fetch(interaction.user.id);
+      if (!member.roles.cache.has(joinRole.id)) {
+        await member.roles.add(joinRole, "Accepted Ro Value Assistant member role");
       }
-
-      await member.roles.add(joinRole, "Accepted Ro Value Assistant member role");
-      await interaction.followUp({
-        content: `✅ You have been accepted and received ${joinRole}.`,
-        ephemeral: true,
-      });
     } catch (error) {
+      // Role could not be given, so keep the ticket open and let them retry.
+      closingTicketChannelIds.delete(channel.id);
       logger.error(
-        { err: error, guildId: interaction.guild.id, userId: interaction.user.id },
+        { err: error, guildId: guild.id, userId: interaction.user.id },
         "Join role assignment failed",
       );
       await interaction.followUp({
         content: "I couldn't give you the Member role. Please ask an administrator to check my role hierarchy.",
         ephemeral: true,
       });
+      return;
     }
-    return;
-  }
 
-  if (action === "reject") {
-    await interaction.deferUpdate();
-
-    const rejectedMemberId = interaction.user.id;
-    const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`join:accept:${ownerId}:${channelId}`)
-        .setLabel("Accepted")
-        .setEmoji("✅")
-        .setStyle(ButtonStyle.Success)
-        .setDisabled(true),
-      new ButtonBuilder()
-        .setCustomId(`join:reject:${ownerId}:${channelId}`)
-        .setLabel("Rejected")
-        .setEmoji("❌")
-        .setStyle(ButtonStyle.Danger)
-        .setDisabled(true),
-    );
-
-    await interaction.message.edit({ components: [disabledRow] }).catch(() => undefined);
-
-    const nextTicket = { ...ticket, state: "closed" as const };
-    closingTicketChannelIds.add(channel.id);
-
-    setTimeout(async () => {
-      try {
-        const member = await interaction.guild!.members.fetch(rejectedMemberId).catch(() => null);
-        if (member?.kickable) {
-          await member.kick("Rejected Member verification");
-        }
-      } catch (error) {
-        logger.error(
-          { err: error, guildId: interaction.guild?.id, userId: rejectedMemberId },
-          "Rejected user kick failed",
-        );
-      }
-
-      await channel.delete("Member panel rejected - 10 second cleanup").catch((error) => {
-        logger.error({ err: error, channelId: channel.id }, "Failed to delete rejected ticket");
-      });
-      closingTicketChannelIds.delete(channel.id);
-    }, 10_000);
+    await interaction.message
+      .edit({ components: [buildDisabledJoinRow(targetId, channelId, "accept")] })
+      .catch(() => undefined);
 
     await channel.send({
       embeds: [
         new EmbedBuilder()
-          .setColor(DANGER_RED)
-          .setTitle("❌ Member Request Rejected")
+          .setColor(SUCCESS_GREEN)
+          .setTitle("✅ Offer Accepted")
           .setDescription(
-            `<@${rejectedMemberId}> rejected the Member request. This ticket is closed and the user will be kicked in **10 seconds**.`,
+            `<@${targetId}> has accepted the offer and received ${joinRole}. This ticket will close in **30 seconds**.`,
           )
           .setFooter({ text: BRAND_NAME }),
       ],
     });
 
-    await channel.permissionOverwrites.set(buildClosedTicketOverwrites(interaction.guild, nextTicket));
+    await channel.permissionOverwrites
+      .set(buildClosedTicketOverwrites(guild, nextTicket))
+      .catch((error) => {
+        logger.error({ err: error, channelId: channel.id }, "Could not lock accepted ticket");
+      });
 
-    try {
-      await saveTicketTranscript(channel, nextTicket);
-    } catch (error) {
-      logger.error({ err: error, channelId: channel.id }, "Rejected ticket transcript save failed");
-    }
+    scheduleJoinTicketCleanup(guild, channel, nextTicket, 30_000, {
+      reason: "Member accepted - ticket closed",
+    });
+    return;
   }
+
+  if (action === "reject") {
+    closingTicketChannelIds.add(channel.id);
+    await interaction.deferUpdate();
+
+    await interaction.message
+      .edit({ components: [buildDisabledJoinRow(targetId, channelId, "decline")] })
+      .catch(() => undefined);
+
+    await channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(DANGER_RED)
+          .setTitle("❌ Offer Declined")
+          .setDescription(
+            `<@${targetId}> declined the offer. They will be kicked and this ticket will close in **10 seconds**.`,
+          )
+          .setFooter({ text: BRAND_NAME }),
+      ],
+    });
+
+    await channel.permissionOverwrites
+      .set(buildClosedTicketOverwrites(guild, nextTicket))
+      .catch((error) => {
+        logger.error({ err: error, channelId: channel.id }, "Could not lock declined ticket");
+      });
+
+    scheduleJoinTicketCleanup(guild, channel, nextTicket, 10_000, {
+      kickUserId: targetId,
+      reason: "Declined Member offer",
+    });
+  }
+}
+
+// Waits, then saves the transcript (so it includes every message), optionally
+// kicks a user, and finally deletes the ticket channel.
+function scheduleJoinTicketCleanup(
+  guild: Guild,
+  channel: TextChannel,
+  ticket: TicketMetadata,
+  delayMs: number,
+  options: { kickUserId?: string; reason: string },
+): void {
+  setTimeout(async () => {
+    try {
+      await saveTicketTranscript(channel, ticket);
+    } catch (error) {
+      logger.error({ err: error, channelId: channel.id }, "Join ticket transcript save failed");
+    }
+
+    if (options.kickUserId) {
+      try {
+        const member = await guild.members.fetch(options.kickUserId).catch(() => null);
+        if (member?.kickable) {
+          await member.kick(options.reason);
+        } else {
+          logger.warn(
+            { guildId: guild.id, userId: options.kickUserId },
+            "Declined user could not be kicked (missing member or role hierarchy)",
+          );
+        }
+      } catch (error) {
+        logger.error(
+          { err: error, guildId: guild.id, userId: options.kickUserId },
+          "Declined user kick failed",
+        );
+      }
+    }
+
+    await channel.delete(options.reason).catch((error) => {
+      logger.error({ err: error, channelId: channel.id }, "Failed to delete join ticket");
+    });
+    closingTicketChannelIds.delete(channel.id);
+  }, delayMs);
 }
 
 async function handleTicketButton(interaction: ButtonInteraction): Promise<void> {
@@ -2292,7 +2402,7 @@ function commandListEmbed(message: Message): EmbedBuilder {
           "`$mmhow` — post the middleman guide",
           "`$conf` — post trade confirmation",
           "`$fee` — post the fee panel",
-          "`$join` — post the Member verification panel (ticket claimer role or admin)",
+          "`$join @user` — post the Member Accept / Decline panel for that user (ticket claimer role or admin)",
         ].join("\n"),
       },
       {
