@@ -83,6 +83,7 @@ const TEMP_COMMAND_GUIDE = [
 const ADMIN_COMMAND_GUIDE = [
   ["`$say`", "compose and send a message (plain or embed) as the bot in the current channel (administrators only)"],
   ["`$addrole @user @role`", "add a role to a member (administrators only)"],
+  ["`$fill`", "give yourself every role between the Accepted Member role and your highest role (Accepted Members only)"],
   ["`$disablerole` / `$enablerole`", "block or allow manual role changes; while blocked, anyone who adds a role by hand is kicked (administrators only)"],
 ] as const;
 
@@ -646,6 +647,11 @@ async function handlePrefixCommand(message: Message): Promise<void> {
 
   if (command === "removevouch") {
     await handleRemoveVouch(message);
+    return;
+  }
+
+  if (command === "fill") {
+    await fillRolesCommand(message);
     return;
   }
 
@@ -1242,6 +1248,80 @@ async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
       await interaction.editReply({ content: "I couldn't send that message.", components: [] });
     }
   }
+}
+
+// `$fill`: gives the caller every role that sits between the configured
+// Accepted Member role (exclusive) and their own highest role (exclusive).
+async function fillRolesCommand(message: Message): Promise<void> {
+  // Available to anyone holding the configured Accepted Member role.
+  if (!message.guild || !message.member || !hasJoinRole(message.guild.id, message.member)) {
+    return;
+  }
+
+  const guild = message.guild;
+  const member = message.member;
+  const reply = (color: number, title: string, description: string) =>
+    message.reply({
+      allowedMentions: { parse: [], repliedUser: false },
+      embeds: [noticeEmbed(color, title, description)],
+    });
+
+  const roles = await guild.roles.fetch();
+  const joinRoleId = ticketConfigs.get(guild.id)?.joinRoleId;
+  const joinRole = joinRoleId ? roles.get(joinRoleId) : undefined;
+  if (!joinRole) {
+    await reply(UI_WARNING, "Fill Roles", "An administrator must run `$ticketsetup` and choose the Accepted Member role first.");
+    return;
+  }
+
+  const highest = member.roles.highest;
+  const inGap = roles
+    .filter(
+      (role) =>
+        role.id !== guild.roles.everyone.id &&
+        !role.managed &&
+        role.position > joinRole.position &&
+        role.position < highest.position,
+    )
+    .sort((first, second) => second.position - first.position);
+
+  if (inGap.size === 0) {
+    await reply(UI_WARNING, "Fill Roles", `There are no roles between ${joinRole} and your highest role ${highest}.`);
+    return;
+  }
+
+  const missing = inGap.filter((role) => !member.roles.cache.has(role.id));
+  if (missing.size === 0) {
+    await reply(UI_PRIMARY, "Fill Roles", `You already have every role between ${joinRole} and ${highest}.`);
+    return;
+  }
+
+  const assignable = missing.filter((role) => role.editable);
+  const skippedCount = missing.size - assignable.size;
+  if (assignable.size === 0) {
+    await reply(UI_WARNING, "Fill Roles", "I cannot manage any of those roles. Move my highest role above them and try again.");
+    return;
+  }
+
+  try {
+    await member.roles.add([...assignable.keys()], `$fill used by ${message.author.tag}`);
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id, userId: member.id }, "$fill failed");
+    await reply(UI_DANGER, "Fill Roles Failed", "I could not add those roles. Please check my permissions and role position.");
+    return;
+  }
+
+  const shown = [...assignable.values()].slice(0, 40).map((role) => `${role}`).join(" ");
+  const extra = assignable.size > 40 ? ` and ${assignable.size - 40} more` : "";
+  const embed = noticeEmbed(
+    UI_SUCCESS,
+    "Roles Filled",
+    `Added **${assignable.size}** role(s) between ${joinRole} and ${highest}:\n${shown}${extra}`,
+  );
+  if (skippedCount > 0) {
+    embed.setFooter({ text: `${skippedCount} role(s) were skipped because they are above my highest role.` });
+  }
+  await message.reply({ allowedMentions: { parse: [], repliedUser: false }, embeds: [embed] });
 }
 
 async function addRoleCommand(message: Message): Promise<void> {
@@ -2967,6 +3047,7 @@ function commandListEmbed(message: Message): EmbedBuilder {
           `Required role: ${joinRole}`,
           "`$cmd` / `$commands` — show this guide",
           "`$temp` — toggle your configured temp mode",
+          "`$fill` — give yourself every role between the Accepted Member role and your highest role",
         ].join("\n"),
       },
       {
