@@ -33,8 +33,8 @@ import {
 } from "discord.js";
 import { logger } from "./lib/logger.js";
 
-const BRAND_NAME = "Ro Value Assistant";
-const TICKET_CATEGORY_NAME = "Ro Value Assistant";
+const BRAND_NAME = "RoSafety Assistant";
+const TICKET_CATEGORY_NAME = "RoSafety Assistant";
 const TICKET_TOPIC_PREFIX = "mm2-ticket:";
 const BRAND_PURPLE = 0x8b5cf6;
 const UI_PRIMARY = 0x6366f1;
@@ -69,6 +69,7 @@ const TICKET_COMMAND_GUIDE = [
   ["`$mmhow`", "post the Middleman info panel with I Understand / I Don't Understand buttons (configured staff roles or administrators)"],
   ["`$conf`", "post a trade confirmation panel with Confirm / Decline buttons (configured staff roles or administrators)"],
   ["`$fee`", "post the middleman fee panel with Pay 50% / Pay 100% buttons (configured staff roles or administrators)"],
+  ["`$verifyfee @user <value>`", "post the one-time verification and collateral notice for a user (ticket claimer only)"],
   ["`$join @user`", "post the Member Accept / Decline panel for the mentioned user; only they can press the buttons (configured ticket claimer roles or administrators)"],
   ["`$ticketconfig`", "change the ticket claim role and Accepted Member role (administrators only)"],
   ["`$joinsetup`", "configure the channel and message the bot posts when a member accepts a `$join` offer (administrators only)"],
@@ -85,7 +86,7 @@ const ADMIN_COMMAND_GUIDE = [
   ["`$addrole @user @role`", "add a role to a member (administrators only)"],
   ["`$removerole @user @role`", "remove a role from a member (administrators only)"],
   ["`$fill`", "give yourself every role between the Accepted Member role and your highest role (Accepted Members only)"],
-  ["`$disablerole` / `$enablerole`", "block or allow manual role changes; while blocked, anyone who adds a role by hand is kicked (administrators only)"],
+  ["`$disablerole` / `$enablerole`", "block or allow manual role changes; while blocked, anyone who adds a role by hand is kicked (server owner only)"],
 ] as const;
 
 const VOUCH_COMMAND_GUIDE = [
@@ -757,6 +758,9 @@ async function handlePrefixCommand(message: Message): Promise<void> {
     case "conf":
       await sendTradeConfirmationPanel(message, ticketContext.channel);
       return;
+    case "verifyfee":
+      await sendVerifyFeePanel(message, ticketContext.channel, ticketContext.ticket);
+      return;
     case "fee":
       await sendMiddlemanFeePanel(message, ticketContext.channel);
       return;
@@ -1259,7 +1263,7 @@ async function handleSayButton(interaction: ButtonInteraction): Promise<void> {
 }
 
 // `$fill`: gives the caller every role that sits between the configured
-// ed Member role (exclusive) and their own highest role (exclusive).
+// Accepted Member role (exclusive) and their own highest role (exclusive).
 async function fillRolesCommand(message: Message): Promise<void> {
   // Available to anyone holding the configured Accepted Member role.
   if (!message.guild || !message.member || !hasJoinRole(message.guild.id, message.member)) {
@@ -1473,7 +1477,8 @@ async function addRoleCommand(message: Message): Promise<void> {
 }
 
 async function setManualRolePolicy(message: Message, manualAllowed: boolean): Promise<void> {
-  if (!message.guild || !message.member || !isAdministrator(message.member)) {
+  // Server owner only: administrators cannot change this setting.
+  if (!message.guild || message.author.id !== message.guild.ownerId) {
     return;
   }
 
@@ -1712,24 +1717,12 @@ async function sendJoinPanel(
     .setTitle("Become a Member")
     .setDescription(
       [
-        "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry",
+        `<@${targetId}>, you have been invited to become a member.`,
         "",
-        "However, There Is A Much More Easier And Profitable Way For You To Recover Your Losses",
+        "**Accept** to receive your Member role. This ticket will close 30 seconds later.",
+        "**Decline** and you will be kicked and this ticket will be closed.",
         "",
-        "**WHAT IS HITTING**",
-        `Hitting Is Where You Scam A Victim/Other People By Using Our Fake Middle Man Services`,
-        "",
-        "There Is No Risk Doing All That Because It Is Totally Secured By VPN Blockchains And No one **IPS** Or **Personal Identity** Is Being Revealed Here",
-        "",
-        "⚠️ Important :",
-        "• You Only Have 5 Minutes To Respond To The Middle Man With Either Accept Or Decline ",
-        "",
-        "• If You **Accept**, You'll Become A Hitter And Start Earning Money With All Of Us And Make Thousands With Us  By Your Skills",
-        "",
-        "If You Try Reporting And Threat Us Then It Is The Most Useless Thing You Would Ever Do So Yeah ",
-        "",
-        "⚠️ **Rejecting closes this ticket and kicks the user who rejects after 10 seconds.**",
-        "**DECISION IS YOURS WITH A RUNNING TIMER SO MAKE IT COUNT**",
+        "Only you can press these buttons.",
       ].join("\n"),
     )
     .setFooter({ text: BRAND_NAME });
@@ -2956,6 +2949,91 @@ async function sendTradeConfirmationPanel(message: Message, channel: TextChannel
   await channel.send({ embeds: [embed], components: [row] });
 }
 
+async function sendVerifyFeePanel(
+  message: Message,
+  channel: TextChannel,
+  ticket: TicketMetadata,
+): Promise<void> {
+  // Only the staff member who claimed this ticket may send the panel.
+  if (!message.guild || ticket.claimerId !== message.author.id) {
+    if (message.guild && !ticket.claimerId && canClaimTicket(message)) {
+      await message.reply({
+        allowedMentions: { repliedUser: false },
+        embeds: [noticeEmbed(UI_WARNING, "Verification Fee", "Claim this ticket first. Only the claimer can send this panel.")],
+      });
+    }
+    return;
+  }
+
+  const targetId = message.content.match(/<@!?(\d+)>/)?.[1];
+  const collateral = message.content
+    .replace(/^\S+/, "")
+    .replace(/<@!?\d+>/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200);
+
+  if (!targetId || !collateral) {
+    await message.reply({
+      allowedMentions: { repliedUser: false },
+      embeds: [
+        noticeEmbed(
+          UI_WARNING,
+          "Verification Fee",
+          "Use `$verifyfee @user <collateral value>`, for example `$verifyfee @user $50 in items`.",
+        ),
+      ],
+    });
+    return;
+  }
+
+  const joinRoleId = ticketConfigs.get(message.guild.id)?.joinRoleId;
+  if (!joinRoleId || !message.guild.roles.cache.has(joinRoleId)) {
+    await message.reply({
+      allowedMentions: { repliedUser: false },
+      embeds: [
+        noticeEmbed(
+          UI_WARNING,
+          "Member Role Not Configured",
+          "An administrator must run `$ticketsetup` and choose the Accepted Member role first.",
+        ),
+      ],
+    });
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(UI_PRIMARY)
+    .setTitle("Verification System")
+    .setDescription(
+      [
+        `Hello, <@${targetId}>!`,
+        "",
+        "» As this is your first time using our Free Middleman Service, a one-time verification is required before you can use our services. This process helps us verify client credibility and maintain a secure trading environment.",
+        "",
+        "**» Verification Process**",
+        `» A **${collateral}** value collateral (cash or eligible in-game items) is provided to the assigned middleman.`,
+        "» The middleman confirms your collateral meets the required value.",
+        `» Once verified, you receive <@&${joinRoleId}>, granting unlimited free access to our MM services.`,
+        "",
+        "**» Collateral Refund**",
+        "» Your collateral is fully refunded after you successfully complete your first trade through our service.",
+        "» If funds are lost due to transaction fees or processing errors, server owners reimburse the full amount.",
+        "",
+        "**Thank you**",
+        `For choosing **${BRAND_NAME}** Middleman Services.`,
+      ].join("\n"),
+    )
+    .setFooter({ text: `${BRAND_NAME} · Verification` })
+    .setTimestamp();
+
+  await channel.send({
+    content: `<@${targetId}>`,
+    embeds: [embed],
+    allowedMentions: { users: [targetId] },
+  });
+}
+
 async function sendMiddlemanFeePanel(message: Message, channel: TextChannel): Promise<void> {
   if (!canClaimTicket(message)) {
     return;
@@ -3189,6 +3267,7 @@ function commandListEmbed(message: Message): EmbedBuilder {
           "`$mmhow` — post the middleman guide",
           "`$conf` — post trade confirmation",
           "`$fee` — post the fee panel",
+          "`$verifyfee @user <value>` — post the verification collateral notice (ticket claimer only)",
           "`$join @user` — post the Member Accept / Decline panel for that user (ticket claimer role or admin)",
         ].join("\n"),
       },
@@ -3202,8 +3281,8 @@ function commandListEmbed(message: Message): EmbedBuilder {
           "`$say` — send a plain or embed message as the bot",
           "`$addrole @user @role` — add a role to a member",
           "`$removerole @user @role` — remove a role from a member",
-          "`$disablerole` — block manual role changes (kicks whoever adds roles by hand)",
-          "`$enablerole` — allow manual role changes again",
+          "`$disablerole` — block manual role changes (kicks whoever adds roles by hand; server owner only)",
+          "`$enablerole` — allow manual role changes again (server owner only)",
         ].join("\n"),
       },
       {
