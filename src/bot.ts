@@ -2896,15 +2896,6 @@ async function handleTicketModal(
   }
 
   try {
-    const existingTicket = findUserTicket(interaction.guild, interaction.user.id);
-    if (existingTicket) {
-      await interaction.reply({
-        content: `You already have an open ticket: ${existingTicket}`,
-        ephemeral: true,
-      });
-      return;
-    }
-
     const otherTrader = interaction.fields.getTextInputValue("other_trader");
     const trade = interaction.fields.getTextInputValue("trade");
     const category = await findOrCreateTicketCategory(interaction.guild);
@@ -2918,7 +2909,15 @@ async function handleTicketModal(
       createdAt: new Date().toISOString(),
       additionalMemberIds: [],
     };
-    const channelName = `ticket-${slugify(interaction.user.username)}`;
+    // Members may have several tickets, so number them to keep names distinct.
+    const baseName = `ticket-${slugify(interaction.user.username)}`;
+    const takenNames = new Set(
+      interaction.guild.channels.cache.map((existing) => existing.name),
+    );
+    let channelName = baseName;
+    for (let number = 2; takenNames.has(channelName); number += 1) {
+      channelName = `${baseName}-${number}`;
+    }
     const ticketChannel = await interaction.guild.channels.create({
       name: channelName,
       type: ChannelType.GuildText,
@@ -4044,17 +4043,6 @@ async function findOrCreateTicketCategory(guild: Guild) {
     name: TICKET_CATEGORY_NAME,
     type: ChannelType.GuildCategory,
   });
-}
-
-function findUserTicket(guild: Guild, userId: string): string | null {
-  const existing = guild.channels.cache.find((channel) => {
-    if (!isTextChannel(channel)) {
-      return false;
-    }
-    const ticket = getTicketData(channel);
-    return ticket?.ownerId === userId && ticket.state !== "closed";
-  });
-  return existing ? `<#${existing.id}>` : null;
 }
 
 function buildTicketOverwrites(
