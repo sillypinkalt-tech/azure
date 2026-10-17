@@ -6,6 +6,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ChannelSelectMenuBuilder,
+  StringSelectMenuBuilder,
   AuditLogEvent,
   ChannelType,
   Client,
@@ -27,6 +28,7 @@ import {
   type GuildMember,
   type Message,
   type ModalSubmitInteraction,
+  type StringSelectMenuInteraction,
   type OverwriteResolvable,
   type Role,
   type TextChannel,
@@ -36,6 +38,7 @@ import { logger } from "./lib/logger.js";
 const BRAND_NAME = "RoSafety Assistant";
 const TICKET_CATEGORY_NAME = "RoSafety Assistant";
 const TICKET_TOPIC_PREFIX = "mm2-ticket:";
+const TICKET_STORE_PATH = join(process.cwd(), "data", "tickets.json");
 const BRAND_PURPLE = 0x8b5cf6;
 const UI_PRIMARY = 0x6366f1;
 const UI_SUCCESS = 0x22c55e;
@@ -73,6 +76,7 @@ const TICKET_COMMAND_GUIDE = [
   ["`$join @user`", "post the Member Accept / Decline panel for the mentioned user; only they can press the buttons (configured ticket claimer roles or administrators)"],
   ["`$ticketconfig`", "change the ticket claim role and Accepted Member role (administrators only)"],
   ["`$joinsetup`", "configure the channel and message the bot posts when a member accepts a `$join` offer (administrators only)"],
+  ["`$rolesetup`", "build a button panel where members toggle roles themselves (administrators only)"],
   ["`$tickethelp`", "show ticket commands only"],
 ] as const;
 
@@ -120,7 +124,24 @@ type TicketConfig = {
   manualRolesDisabled?: boolean;
   // Channel where role-guard alerts are posted (the channel $disablerole was run in).
   roleAlertChannelId?: string;
+  rolePanel?: RolePanel;
   updatedAt: string;
+};
+
+type RolePanelButton = {
+  roleId: string;
+  label: string;
+  emoji?: string;
+  style: "grey" | "blue" | "green" | "red";
+};
+
+type RolePanel = {
+  title: string;
+  description: string;
+  bottomText: string;
+  buttons: RolePanelButton[];
+  channelId?: string;
+  messageId?: string;
 };
 
 type JoinAnnouncement = {
@@ -156,6 +177,8 @@ const status: DiscordBotStatus = {
 let client: Client | null = null;
 let startPromise: Promise<void> | null = null;
 const ticketConfigs = new Map<string, TicketConfig>();
+// Ticket data lives here (and in data/tickets.json), not in the channel topic.
+const ticketStore = new Map<string, TicketMetadata>();
 type SayDraft = { channelId: string; content: string; title: string | null };
 const sayDrafts = new Map<string, SayDraft>();
 const vouchCounts = new Map<string, number>();
@@ -188,6 +211,7 @@ async function connectDiscordBot(): Promise<void> {
   }
 
   await loadTicketConfigs();
+  await loadTicketStore();
   await loadVouchCounts();
   status.state = "starting";
   status.lastError = null;
@@ -214,6 +238,15 @@ async function connectDiscordBot(): Promise<void> {
     );
 
     void registerCommands(readyClient.user.id, token);
+    for (const guild of readyClient.guilds.cache.values()) {
+      void migrateLegacyTicketTopics(guild);
+    }
+  });
+
+  nextClient.on(Events.ChannelDelete, (channel) => {
+    if (ticketStore.delete(channel.id)) {
+      void persistTicketStore();
+    }
   });
 
   nextClient.on(Events.InteractionCreate, (interaction) => {
@@ -229,6 +262,11 @@ async function connectDiscordBot(): Promise<void> {
 
     if (interaction.isChannelSelectMenu()) {
       void handleTranscriptChannelSelect(interaction);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu()) {
+      void handleRoleSetupSelect(interaction);
     }
   });
 
@@ -676,6 +714,11 @@ async function handlePrefixCommand(message: Message): Promise<void> {
 
   if (command === "disablerole") {
     await setManualRolePolicy(message, false);
+    return;
+  }
+
+  if (command === "rolesetup" || command === "rolessetup") {
+    await startRoleSetup(message);
     return;
   }
 
@@ -1644,7 +1687,7 @@ async function syncOpenTicketPermissions(guild: Guild): Promise<void> {
       if (!isTextChannel(channel)) {
         return;
       }
-      const ticket = decodeTicketTopic(channel.topic);
+      const ticket = getTicketData(channel);
       if (ticket?.state === "open") {
         const synced = withLiveExtras(channel, ticket, [ticket.ownerId]);
         await channel.permissionOverwrites.set(
@@ -1795,7 +1838,7 @@ async function handleJoinButton(interaction: ButtonInteraction): Promise<void> {
   }
 
   const channel = getInteractionTextChannel(interaction);
-  const ticket = channel ? decodeTicketTopic(channel.topic) : null;
+  const ticket = channel ? getTicketData(channel) : null;
   if (!channel || !ticket || channel.id !== channelId) {
     await interaction.reply({
       content: "This Member panel is no longer connected to an active ticket.",
@@ -1960,6 +2003,478 @@ async function sendJoinAnnouncement(
     });
   } catch (error) {
     logger.error({ err: error, guildId: guild.id }, "Join announcement failed");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Role panel ($rolesetup): admin-built button panel where members toggle roles.
+// ---------------------------------------------------------------------------
+
+const ROLE_PANEL_MAX_BUTTONS = 25;
+const ROLE_PANEL_STYLES: Record<RolePanelButton["style"], ButtonStyle> = {
+  grey: ButtonStyle.Secondary,
+  blue: ButtonStyle.Primary,
+  green: ButtonStyle.Success,
+  red: ButtonStyle.Danger,
+};
+
+// A self-assign panel must never be able to hand out powerful roles.
+const SELF_ASSIGN_BLOCKED_PERMISSIONS = [
+  PermissionFlagsBits.Administrator,
+  PermissionFlagsBits.ManageGuild,
+  PermissionFlagsBits.ManageRoles,
+  PermissionFlagsBits.ManageChannels,
+  PermissionFlagsBits.ManageMessages,
+  PermissionFlagsBits.ManageWebhooks,
+  PermissionFlagsBits.ManageNicknames,
+  PermissionFlagsBits.KickMembers,
+  PermissionFlagsBits.BanMembers,
+  PermissionFlagsBits.ModerateMembers,
+  PermissionFlagsBits.MentionEveryone,
+];
+
+function getRolePanel(guildId: string): RolePanel {
+  return (
+    ticketConfigs.get(guildId)?.rolePanel ?? {
+      title: "Get Roles",
+      description: "Choose your roles below.",
+      bottomText: "",
+      buttons: [],
+    }
+  );
+}
+
+function selfAssignProblem(role: Role): string | null {
+  if (role.id === role.guild.id) {
+    return "@everyone cannot be used.";
+  }
+  if (role.managed) {
+    return "that role is managed by an integration.";
+  }
+  if (role.permissions.any(SELF_ASSIGN_BLOCKED_PERMISSIONS)) {
+    return "that role has administrator or moderation permissions, so members must not be able to give it to themselves.";
+  }
+  if (!role.editable) {
+    return "that role is above my highest role. Move my role above it first.";
+  }
+  return null;
+}
+
+function buildRolePanelPayload(panel: RolePanel) {
+  const embed = new EmbedBuilder()
+    .setColor(UI_PRIMARY)
+    .setTitle(panel.title.slice(0, 256))
+    .setFooter({ text: BRAND_NAME });
+  const body = [panel.description, panel.bottomText].filter((part) => part.trim()).join("\n\n");
+  if (body) {
+    embed.setDescription(body.slice(0, 4000));
+  }
+
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+  panel.buttons.forEach((entry, index) => {
+    if (index % 5 === 0) {
+      rows.push(new ActionRowBuilder<ButtonBuilder>());
+    }
+    const button = new ButtonBuilder()
+      .setCustomId(`rr:${entry.roleId}`)
+      .setLabel(entry.label)
+      .setStyle(ROLE_PANEL_STYLES[entry.style]);
+    if (entry.emoji) {
+      button.setEmoji(entry.emoji);
+    }
+    rows[rows.length - 1].addComponents(button);
+  });
+
+  return { embeds: [embed], components: rows };
+}
+
+function buildRoleSetupMessage(guild: Guild, adminId: string) {
+  const panel = getRolePanel(guild.id);
+  const buttonList = panel.buttons
+    .map((entry) => `${entry.emoji ? `${entry.emoji} ` : ""}**${entry.label}** - <@&${entry.roleId}>`)
+    .join("\n");
+
+  const embed = new EmbedBuilder()
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle("Role Panel Setup")
+    .setDescription(
+      "Build a panel where members press a button to receive or remove a role. Use Edit Panel Text for the title and wording, Add Role Button for each role, then Post Panel to publish it in this channel. Posting again updates the existing panel if it is in the same channel.",
+    )
+    .addFields(
+      { name: "Title", value: panel.title.slice(0, 256) || "None" },
+      { name: "Description", value: panel.description.slice(0, 900) || "None" },
+      {
+        name: `Buttons (${panel.buttons.length}/${ROLE_PANEL_MAX_BUTTONS})`,
+        value: buttonList.slice(0, 1000) || "No buttons added yet.",
+      },
+    )
+    .setFooter({ text: "Only administrators can change this panel." });
+
+  const actions = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`rolesetup:text:${adminId}`).setLabel("Edit Panel Text").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`rolesetup:add:${adminId}`).setLabel("Add Role Button").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`rolesetup:post:${adminId}`).setLabel("Post Panel").setStyle(ButtonStyle.Success),
+  );
+
+  const components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [
+    actions as ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>,
+  ];
+
+  if (panel.buttons.length > 0) {
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`rolesetup:remove:${adminId}`)
+      .setPlaceholder("Remove a button")
+      .addOptions(
+        panel.buttons.map((entry) => ({
+          label: entry.label.slice(0, 100),
+          value: entry.roleId,
+          description: (guild.roles.cache.get(entry.roleId)?.name ?? "Deleted role").slice(0, 100),
+        })),
+      );
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select) as ActionRowBuilder<
+        ButtonBuilder | StringSelectMenuBuilder
+      >,
+    );
+  }
+
+  return { embeds: [embed], components };
+}
+
+async function startRoleSetup(message: Message): Promise<void> {
+  if (!message.guild || !message.member || !isAdministrator(message.member)) {
+    return;
+  }
+  if (!isTextChannel(message.channel)) {
+    await message.reply("This command can only be used in a server text channel.");
+    return;
+  }
+
+  await message.reply({
+    ...buildRoleSetupMessage(message.guild, message.author.id),
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+function roleSetupAdminId(customId: string): string | undefined {
+  return customId.split(":")[2];
+}
+
+async function handleRoleSetupButton(interaction: ButtonInteraction): Promise<void> {
+  try {
+    const action = interaction.customId.split(":")[1];
+    const guild = interaction.guild;
+    if (
+      !guild ||
+      interaction.user.id !== roleSetupAdminId(interaction.customId) ||
+      !isAdministrator(interaction.member)
+    ) {
+      return;
+    }
+
+    const panel = getRolePanel(guild.id);
+
+    if (action === "text") {
+      // showModal() is the acknowledgement for this button.
+      const titleInput = new TextInputBuilder()
+        .setCustomId("panel_title")
+        .setLabel("Title")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(200)
+        .setValue(panel.title.slice(0, 200));
+      const descriptionInput = new TextInputBuilder()
+        .setCustomId("panel_description")
+        .setLabel("Description (supports Discord formatting)")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false)
+        .setMaxLength(3500);
+      if (panel.description) {
+        descriptionInput.setValue(panel.description.slice(0, 3500));
+      }
+      const bottomInput = new TextInputBuilder()
+        .setCustomId("panel_bottom")
+        .setLabel("Text below the description (optional)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setMaxLength(400);
+      if (panel.bottomText) {
+        bottomInput.setValue(panel.bottomText.slice(0, 400));
+      }
+      await interaction.showModal(
+        new ModalBuilder()
+          .setCustomId(`rolesetup:textmodal:${interaction.user.id}`)
+          .setTitle("Panel Text")
+          .addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(titleInput),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(descriptionInput),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(bottomInput),
+          ),
+      );
+      return;
+    }
+
+    if (action === "add") {
+      const roleInput = new TextInputBuilder()
+        .setCustomId("button_role")
+        .setLabel("Role (mention, ID or exact name)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(100);
+      const labelInput = new TextInputBuilder()
+        .setCustomId("button_label")
+        .setLabel("Button label")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(80);
+      const emojiInput = new TextInputBuilder()
+        .setCustomId("button_emoji")
+        .setLabel("Emoji (optional)")
+        .setPlaceholder("A normal emoji or a custom one like <:name:123456789>")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setMaxLength(80);
+      const styleInput = new TextInputBuilder()
+        .setCustomId("button_style")
+        .setLabel("Colour (optional): grey, blue, green or red")
+        .setPlaceholder("grey")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setMaxLength(10);
+      await interaction.showModal(
+        new ModalBuilder()
+          .setCustomId(`rolesetup:addmodal:${interaction.user.id}`)
+          .setTitle("Add Role Button")
+          .addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(roleInput),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(labelInput),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(emojiInput),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(styleInput),
+          ),
+      );
+      return;
+    }
+
+    if (action === "post") {
+      await interaction.deferReply({ ephemeral: true });
+      const reply = (color: number, title: string, description: string) =>
+        interaction.editReply({ embeds: [noticeEmbed(color, title, description)] });
+
+      if (panel.buttons.length === 0) {
+        await reply(UI_WARNING, "Role Panel", "Add at least one role button before posting.");
+        return;
+      }
+
+      const channel = getInteractionTextChannel(interaction);
+      if (!channel) {
+        await reply(UI_WARNING, "Role Panel", "Run this in a server text channel.");
+        return;
+      }
+
+      const payload = buildRolePanelPayload(panel);
+      try {
+        let posted: Message | null = null;
+        let updated = false;
+        if (panel.channelId === channel.id && panel.messageId) {
+          const existing = await channel.messages.fetch(panel.messageId).catch(() => null);
+          if (existing && existing.author.id === interaction.client.user?.id) {
+            posted = await existing.edit(payload);
+            updated = true;
+          }
+        }
+        if (!posted) {
+          posted = await channel.send(payload);
+        }
+        await updateTicketConfig(guild.id, {
+          rolePanel: { ...panel, channelId: channel.id, messageId: posted.id },
+        });
+        await reply(
+          UI_SUCCESS,
+          updated ? "Panel Updated" : "Panel Posted",
+          updated ? "The existing panel was updated." : `The panel is live in ${channel}.`,
+        );
+      } catch (error) {
+        logger.error({ err: error, guildId: guild.id }, "Role panel post failed");
+        await reply(UI_DANGER, "Role Panel", "I could not post the panel. I need View Channel, Send Messages and Embed Links in this channel.");
+      }
+    }
+  } catch (error) {
+    await reportInteractionError(interaction, error, "Role setup button failed");
+  }
+}
+
+function resolveRoleInput(guild: Guild, input: string): Role | undefined {
+  const value = input.trim();
+  const id = value.match(/<@&(\d+)>/)?.[1] ?? value.match(/^\d{15,25}$/)?.[0];
+  if (id) {
+    return guild.roles.cache.get(id);
+  }
+  const lowered = value.toLowerCase();
+  return guild.roles.cache.find((role) => role.name.toLowerCase() === lowered);
+}
+
+function isAcceptableButtonEmoji(value: string): boolean {
+  return (
+    /^<a?:\w{2,32}:\d{15,25}>$/.test(value) ||
+    /^\p{Extended_Pictographic}[\p{Extended_Pictographic}️‍]*$/u.test(value)
+  );
+}
+
+async function handleRoleSetupModal(interaction: ModalSubmitInteraction): Promise<void> {
+  try {
+    const action = interaction.customId.split(":")[1];
+    const guild = interaction.guild;
+    if (
+      !guild ||
+      interaction.user.id !== roleSetupAdminId(interaction.customId) ||
+      !isAdministrator(interaction.member)
+    ) {
+      return;
+    }
+
+    const warn = (description: string) =>
+      interaction.reply({
+        embeds: [noticeEmbed(UI_WARNING, "Role Panel Setup", description)],
+        ephemeral: true,
+      });
+
+    const panel = getRolePanel(guild.id);
+    let nextPanel: RolePanel;
+
+    if (action === "textmodal") {
+      nextPanel = {
+        ...panel,
+        title: interaction.fields.getTextInputValue("panel_title").trim() || panel.title,
+        description: interaction.fields.getTextInputValue("panel_description").trim(),
+        bottomText: interaction.fields.getTextInputValue("panel_bottom").trim(),
+      };
+    } else if (action === "addmodal") {
+      await guild.roles.fetch();
+      const role = resolveRoleInput(guild, interaction.fields.getTextInputValue("button_role"));
+      if (!role) {
+        await warn("That role could not be found. Use a role mention, its ID, or its exact name.");
+        return;
+      }
+      const problem = selfAssignProblem(role);
+      if (problem) {
+        await warn(`${role} cannot be used: ${problem}`);
+        return;
+      }
+
+      const label = interaction.fields.getTextInputValue("button_label").trim();
+      const emoji = interaction.fields.getTextInputValue("button_emoji").trim();
+      const styleRaw = interaction.fields.getTextInputValue("button_style").trim().toLowerCase();
+      const style = (["grey", "blue", "green", "red"] as const).find((name) => name === styleRaw) ?? "grey";
+      if (!label) {
+        await warn("Please enter a button label.");
+        return;
+      }
+      if (styleRaw && !["grey", "blue", "green", "red"].includes(styleRaw)) {
+        await warn("Colour must be grey, blue, green or red.");
+        return;
+      }
+      if (emoji && !isAcceptableButtonEmoji(emoji)) {
+        await warn("That emoji is not valid. Use a standard emoji or a custom one in the form `<:name:123456789>`.");
+        return;
+      }
+
+      const entry: RolePanelButton = { roleId: role.id, label, style, ...(emoji ? { emoji } : {}) };
+      const existingIndex = panel.buttons.findIndex((button) => button.roleId === role.id);
+      if (existingIndex === -1 && panel.buttons.length >= ROLE_PANEL_MAX_BUTTONS) {
+        await warn(`A panel can hold at most ${ROLE_PANEL_MAX_BUTTONS} buttons.`);
+        return;
+      }
+      const buttons = [...panel.buttons];
+      if (existingIndex === -1) {
+        buttons.push(entry);
+      } else {
+        buttons[existingIndex] = entry;
+      }
+      nextPanel = { ...panel, buttons };
+    } else {
+      return;
+    }
+
+    await updateTicketConfig(guild.id, { rolePanel: nextPanel });
+    const view = buildRoleSetupMessage(guild, interaction.user.id);
+    if (interaction.isFromMessage()) {
+      await interaction.update(view);
+    } else {
+      await interaction.reply({ ...view, ephemeral: true });
+    }
+  } catch (error) {
+    await reportInteractionError(interaction, error, "Role setup modal failed");
+  }
+}
+
+async function handleRoleSetupSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+  try {
+    if (!interaction.customId.startsWith("rolesetup:remove:")) {
+      return;
+    }
+    const guild = interaction.guild;
+    if (
+      !guild ||
+      interaction.user.id !== roleSetupAdminId(interaction.customId) ||
+      !isAdministrator(interaction.member)
+    ) {
+      return;
+    }
+
+    const roleId = interaction.values[0];
+    const panel = getRolePanel(guild.id);
+    await updateTicketConfig(guild.id, {
+      rolePanel: { ...panel, buttons: panel.buttons.filter((button) => button.roleId !== roleId) },
+    });
+    await interaction.update(buildRoleSetupMessage(guild, interaction.user.id));
+  } catch (error) {
+    await reportInteractionError(interaction, error, "Role setup select failed");
+  }
+}
+
+async function handleRolePanelToggle(interaction: ButtonInteraction): Promise<void> {
+  try {
+    const guild = interaction.guild;
+    if (!guild) {
+      return;
+    }
+    await interaction.deferReply({ ephemeral: true });
+
+    const reply = (color: number, title: string, description: string) =>
+      interaction.editReply({ embeds: [noticeEmbed(color, title, description)] });
+
+    const roleId = interaction.customId.slice("rr:".length);
+    const panel = ticketConfigs.get(guild.id)?.rolePanel;
+    // Only roles that are still on the saved panel can be toggled, so a
+    // removed button stops working even on old panel messages.
+    if (!panel?.buttons.some((button) => button.roleId === roleId)) {
+      await reply(UI_WARNING, "Role Panel", "This role button is no longer active.");
+      return;
+    }
+
+    const role = guild.roles.cache.get(roleId);
+    if (!role) {
+      await reply(UI_WARNING, "Role Panel", "That role no longer exists.");
+      return;
+    }
+
+    const problem = selfAssignProblem(role);
+    if (problem) {
+      await reply(UI_WARNING, "Role Panel", `I cannot change ${role}: ${problem}`);
+      return;
+    }
+
+    const member = await guild.members.fetch(interaction.user.id);
+    if (member.roles.cache.has(role.id)) {
+      await member.roles.remove(role, "Role panel toggle");
+      await reply(UI_DANGER, "Role Removed", `${role} was removed.`);
+    } else {
+      await member.roles.add(role, "Role panel toggle");
+      await reply(UI_SUCCESS, "Role Added", `${role} was added.`);
+    }
+  } catch (error) {
+    await reportInteractionError(interaction, error, "Role panel toggle failed");
   }
 }
 
@@ -2263,6 +2778,16 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
       return;
     }
 
+    if (interaction.customId.startsWith("rr:")) {
+      await handleRolePanelToggle(interaction);
+      return;
+    }
+
+    if (interaction.customId.startsWith("rolesetup:")) {
+      await handleRoleSetupButton(interaction);
+      return;
+    }
+
     if (interaction.customId.startsWith("joinsetup:open:")) {
       // showModal() is the acknowledgement for this button.
       await showJoinSetupModal(interaction);
@@ -2291,7 +2816,7 @@ async function handleTicketButton(interaction: ButtonInteraction): Promise<void>
     }
 
     const channel = getInteractionTextChannel(interaction);
-    const ticket = channel ? decodeTicketTopic(channel.topic) : null;
+    const ticket = channel ? getTicketData(channel) : null;
     if (!channel || !ticket) {
       await interaction.reply({
         content: "This button can only be used inside an active ticket.",
@@ -2361,6 +2886,11 @@ async function handleTicketModal(
     return;
   }
 
+  if (interaction.customId.startsWith("rolesetup:")) {
+    await handleRoleSetupModal(interaction);
+    return;
+  }
+
   if (interaction.customId !== "ticket:create" || !interaction.guild) {
     return;
   }
@@ -2393,9 +2923,11 @@ async function handleTicketModal(
       name: channelName,
       type: ChannelType.GuildText,
       parent: category.id,
-      topic: encodeTicketTopic(ticket),
+      topic: ticketTopicText(ticket),
       permissionOverwrites: buildTicketOverwrites(interaction.guild, ticket),
     });
+    ticketStore.set(ticketChannel.id, ticket);
+    await persistTicketStore();
 
     const ticketEmbed = new EmbedBuilder()
       .setColor(UI_PRIMARY)
@@ -3277,6 +3809,7 @@ function commandListEmbed(message: Message): EmbedBuilder {
           "`$ticketsetup` — configure claim + Accepted Member roles and publish the panel",
           "`$ticketconfig` — update claim + Accepted Member roles",
           "`$joinsetup` — configure the announcement posted when a member accepts `$join`",
+          "`$rolesetup` — build a role button panel for members",
           "`$tempsetup @Role1 @Role2 ...` — configure temp roles",
           "`$say` — send a plain or embed message as the bot",
           "`$addrole @user @role` — add a role to a member",
@@ -3330,7 +3863,7 @@ function ticketHelpEmbed(): EmbedBuilder {
       },
       {
         name: "Administrators",
-        value: "`$ticketsetup` — configure roles and post the panel\n`$ticketconfig` — change claim roles later\n`$joinsetup` — configure the member-accepted announcement",
+        value: "`$ticketsetup` — configure roles and post the panel\n`$ticketconfig` — change claim roles later\n`$joinsetup` — configure the member-accepted announcement\n`$rolesetup` — build a role button panel",
       },
     )
     .setFooter({ text: "Keep ticket conversations inside the ticket channel." })
@@ -3344,7 +3877,7 @@ function getTicketContext(
     return null;
   }
 
-  const ticket = decodeTicketTopic(message.channel.topic);
+  const ticket = getTicketData(message.channel);
   if (!ticket || !isTextChannel(message.channel)) {
     return null;
   }
@@ -3378,10 +3911,6 @@ function isTextChannel(channel: unknown): channel is TextChannel {
   );
 }
 
-function encodeTicketTopic(ticket: TicketMetadata): string {
-  return `${TICKET_TOPIC_PREFIX}${Buffer.from(JSON.stringify(ticket), "utf8").toString("base64url")}`;
-}
-
 function decodeTicketTopic(topic: string | null): TicketMetadata | null {
   if (!topic?.startsWith(TICKET_TOPIC_PREFIX)) {
     return null;
@@ -3411,11 +3940,94 @@ function decodeTicketTopic(topic: string | null): TicketMetadata | null {
   }
 }
 
+function ticketTopicText(ticket: TicketMetadata): string {
+  const status = ticket.state === "closed" ? "Closed" : ticket.claimerId ? "Claimed" : "Open";
+  return `${BRAND_NAME} middleman ticket \u00B7 ${status}`;
+}
+
+async function loadTicketStore(): Promise<void> {
+  try {
+    const raw = await readFile(TICKET_STORE_PATH, "utf8");
+    const saved = JSON.parse(raw) as Record<string, TicketMetadata>;
+    for (const [channelId, ticket] of Object.entries(saved)) {
+      if (ticket && ticket.version === 1 && ticket.ownerId) {
+        if (!Array.isArray(ticket.additionalMemberIds)) {
+          ticket.additionalMemberIds = [];
+        }
+        ticketStore.set(channelId, ticket);
+      }
+    }
+    logger.info({ ticketCount: ticketStore.size }, "Ticket data loaded");
+  } catch (error) {
+    if (!isFileNotFoundError(error)) {
+      logger.error({ err: error }, "Ticket data could not be loaded");
+    }
+  }
+}
+
+let ticketStoreWrite: Promise<void> = Promise.resolve();
+
+function persistTicketStore(): Promise<void> {
+  // Writes are chained so two quick updates can't interleave on disk.
+  ticketStoreWrite = ticketStoreWrite
+    .catch(() => undefined)
+    .then(async () => {
+      await mkdir(join(process.cwd(), "data"), { recursive: true });
+      await writeFile(
+        TICKET_STORE_PATH,
+        JSON.stringify(Object.fromEntries(ticketStore), null, 2),
+      );
+    })
+    .catch((error) => {
+      logger.error({ err: error }, "Ticket data could not be saved");
+    });
+  return ticketStoreWrite;
+}
+
+function getTicketData(channel: { id: string; topic: string | null }): TicketMetadata | null {
+  const stored = ticketStore.get(channel.id);
+  if (stored) {
+    return stored;
+  }
+
+  // Tickets created by older versions keep their data in the topic.
+  const legacy = decodeTicketTopic(channel.topic);
+  if (legacy) {
+    ticketStore.set(channel.id, legacy);
+    void persistTicketStore();
+  }
+  return legacy;
+}
+
+async function migrateLegacyTicketTopics(guild: Guild): Promise<void> {
+  for (const channel of guild.channels.cache.values()) {
+    if (!isTextChannel(channel) || !channel.topic?.startsWith(TICKET_TOPIC_PREFIX)) {
+      continue;
+    }
+    const ticket = getTicketData(channel);
+    if (ticket) {
+      await channel.setTopic(ticketTopicText(ticket)).catch((error) => {
+        logger.warn({ err: error, channelId: channel.id }, "Could not clean legacy ticket topic");
+      });
+    }
+  }
+}
+
 async function updateTicket(
   channel: TextChannel,
   ticket: TicketMetadata,
 ): Promise<void> {
-  await channel.setTopic(encodeTicketTopic(ticket));
+  ticketStore.set(channel.id, ticket);
+  await persistTicketStore();
+
+  // The topic is only a readable label now. Discord rate-limits topic edits,
+  // so it is updated in the background and never blocks the ticket.
+  const topic = ticketTopicText(ticket);
+  if (channel.topic !== topic) {
+    void channel.setTopic(topic).catch((error) => {
+      logger.warn({ err: error, channelId: channel.id }, "Ticket topic label not updated");
+    });
+  }
 }
 
 async function findOrCreateTicketCategory(guild: Guild) {
@@ -3439,7 +4051,7 @@ function findUserTicket(guild: Guild, userId: string): string | null {
     if (!isTextChannel(channel)) {
       return false;
     }
-    const ticket = decodeTicketTopic(channel.topic);
+    const ticket = getTicketData(channel);
     return ticket?.ownerId === userId && ticket.state !== "closed";
   });
   return existing ? `<#${existing.id}>` : null;
@@ -3703,7 +4315,7 @@ async function replyToActor(
 }
 
 async function reportInteractionError(
-  interaction: ButtonInteraction | ModalSubmitInteraction,
+  interaction: ButtonInteraction | ModalSubmitInteraction | StringSelectMenuInteraction,
   error: unknown,
   context: string,
 ): Promise<void> {
