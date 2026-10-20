@@ -77,16 +77,18 @@ const TICKET_COMMAND_GUIDE = [
   ["`$ticketconfig`", "change the ticket claim role and Accepted Member role (administrators only)"],
   ["`$joinsetup`", "configure the channel and message the bot posts when a member accepts a `$join` offer (administrators only)"],
   ["`$rolesetup`", "build a button panel where members toggle roles themselves (administrators only)"],
-  ["`$tickethelp`", "show ticket commands only"],
+  ["`$tickethelp` / `$help`", "show ticket commands only"],
 ] as const;
 
 const TEMP_COMMAND_GUIDE = [
   ["`$tempsetup @Role1 @Role2 ...`", "set the roles members must already have and keep when using `$temp` (administrators only)"],
   ["`$temp`", "toggle temp mode: keep only the configured role, then restore your roles when used again"],
+  ["`$transferroles @user`", "move all your roles above the `$tempsetup` roles to another member (same access as `$temp`)"],
 ] as const;
 
 const ADMIN_COMMAND_GUIDE = [
   ["`$say`", "compose and send a message (plain or embed) as the bot in the current channel (administrators only)"],
+  ["`$purge <1-20>`", "delete the most recent messages in the current channel (administrators only)"],
   ["`$addrole @user @role`", "add a role to a member (administrators only)"],
   ["`$removerole @user @role`", "remove a role from a member (administrators only)"],
   ["`$fill`", "give yourself every role between the Accepted Member role and your highest role (Accepted Members only)"],
@@ -474,6 +476,190 @@ async function configureTempRole(message: Message): Promise<void> {
   });
 }
 
+// `$transferroles @user`: moves every role the caller holds that sits above
+// the `$tempsetup` roles to another member. Same access rule as `$temp`.
+const PURGE_MAX_MESSAGES = 20;
+
+// `$purge <1-20>`: administrators only. Deletes the newest messages before the
+// command (pinned messages are kept; Discord cannot bulk-delete messages older
+// than 14 days, so those are skipped).
+async function purgeCommand(message: Message, args: string[]): Promise<void> {
+  if (!message.guild || !message.member || !isAdministrator(message.member)) {
+    return;
+  }
+
+  const channel = message.channel;
+  if (!isTextChannel(channel)) {
+    return;
+  }
+
+  const reply = async (color: number, title: string, description: string, autoDeleteMs?: number) => {
+    const sent = await message.reply({
+      allowedMentions: { parse: [], repliedUser: false },
+      embeds: [noticeEmbed(color, title, description)],
+    });
+    if (autoDeleteMs) {
+      setTimeout(() => void sent.delete().catch(() => undefined), autoDeleteMs);
+    }
+  };
+
+  const requested = Number(args[0]);
+  if (!Number.isInteger(requested) || requested < 1) {
+    await reply(UI_WARNING, "Purge", `Use \`$purge <1-${PURGE_MAX_MESSAGES}>\`, for example \`$purge 10\`.`, 8_000);
+    return;
+  }
+  if (requested > PURGE_MAX_MESSAGES) {
+    await reply(UI_WARNING, "Purge", `You can purge at most ${PURGE_MAX_MESSAGES} messages at a time.`, 8_000);
+    return;
+  }
+
+  const me = await message.guild.members.fetchMe().catch(() => null);
+  if (!me || !channel.permissionsFor(me)?.has([PermissionFlagsBits.ManageMessages, PermissionFlagsBits.ReadMessageHistory])) {
+    await reply(UI_DANGER, "Purge", "I need Manage Messages and Read Message History in this channel.", 10_000);
+    return;
+  }
+
+  try {
+    const recent = await channel.messages.fetch({ limit: requested, before: message.id });
+    const deletable = recent.filter((candidate) => !candidate.pinned);
+    // `true` skips messages older than 14 days instead of failing the whole batch.
+    const removed = deletable.size > 0 ? await channel.bulkDelete(deletable, true) : null;
+    const count = removed?.size ?? 0;
+    await reply(
+      count > 0 ? UI_SUCCESS : UI_WARNING,
+      "Purge",
+      count > 0
+        ? `Deleted ${count} message${count === 1 ? "" : "s"}.`
+        : "There were no messages that could be deleted. Pinned messages and messages older than 14 days are skipped.",
+      5_000,
+    );
+  } catch (error) {
+    logger.error({ err: error, channelId: channel.id }, "$purge failed");
+    await reply(UI_DANGER, "Purge", "I could not delete those messages. Please check my permissions in this channel.", 10_000);
+  }
+}
+
+async function transferRolesCommand(message: Message): Promise<void> {
+  if (!message.member || !message.guild) {
+    return;
+  }
+
+  const guild = message.guild;
+  const caller = message.member;
+  const config = ticketConfigs.get(guild.id);
+  const configuredTempRoleIds = config?.tempRoleIds?.length
+    ? config.tempRoleIds
+    : config?.tempRoleId
+      ? [config.tempRoleId]
+      : [];
+
+  const reply = (color: number, title: string, description: string) =>
+    message.reply({
+      allowedMentions: { parse: [], repliedUser: false },
+      embeds: [noticeEmbed(color, title, description)],
+    });
+
+  if (configuredTempRoleIds.length === 0) {
+    await reply(UI_WARNING, "Transfer Roles", "An administrator must run `$tempsetup @Role1 @Role2 ...` first.");
+    return;
+  }
+
+  const tempRoles = configuredTempRoleIds
+    .map((roleId) => guild.roles.cache.get(roleId))
+    .filter((role): role is Role => Boolean(role));
+  if (tempRoles.length === 0) {
+    await reply(UI_WARNING, "Transfer Roles", "The configured temp roles no longer exist. Ask an administrator to run `$tempsetup` again.");
+    return;
+  }
+
+  // Only people who could use `$temp` (they hold every temp role) may do this.
+  if (tempRoles.some((role) => !caller.roles.cache.has(role.id))) {
+    return;
+  }
+
+  const targetId =
+    message.mentions.users.first()?.id ??
+    message.content.replace(/<@&\d+>/g, "").match(/\b(\d{15,25})\b/)?.[1];
+  if (!targetId) {
+    await reply(UI_WARNING, "Transfer Roles", "Use `$transferroles @user`.");
+    return;
+  }
+  if (targetId === caller.id) {
+    await reply(UI_WARNING, "Transfer Roles", "You cannot transfer roles to yourself.");
+    return;
+  }
+
+  const target = await guild.members.fetch(targetId).catch(() => null);
+  if (!target) {
+    await reply(UI_WARNING, "Transfer Roles", "That member could not be found in this server.");
+    return;
+  }
+  if (target.user.bot) {
+    await reply(UI_WARNING, "Transfer Roles", "Roles cannot be transferred to a bot.");
+    return;
+  }
+  if (!target.manageable) {
+    await reply(UI_WARNING, "Transfer Roles", `I cannot change the roles of <@${target.id}>. Their highest role is at or above mine, or they own the server.`);
+    return;
+  }
+  if (caller.id === guild.ownerId) {
+    await reply(UI_WARNING, "Transfer Roles", "I cannot remove roles from the server owner.");
+    return;
+  }
+
+  // "Above the tempsetup roles" means higher than every configured temp role.
+  const floor = Math.max(...tempRoles.map((role) => role.position));
+  const above = caller.roles.cache.filter(
+    (role) => role.id !== guild.id && !role.managed && role.position > floor,
+  );
+  const movable = above.filter((role) => role.editable);
+  const skipped = above.size - movable.size;
+
+  if (movable.size === 0) {
+    await reply(
+      UI_WARNING,
+      "Transfer Roles",
+      above.size > 0
+        ? "I cannot manage any of your roles above the temp roles. Move my highest role above them."
+        : "You have no roles above the temp roles to transfer.",
+    );
+    return;
+  }
+
+  const roleIds = [...movable.keys()];
+  const reason = `$transferroles used by ${message.author.tag}`;
+
+  try {
+    // Give first, then take, so a failure can never leave both people without the roles.
+    await target.roles.add(roleIds, reason);
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id, targetId }, "$transferroles could not add roles");
+    await reply(UI_DANGER, "Transfer Failed", "I could not give those roles to that member. Nothing was changed.");
+    return;
+  }
+
+  let removeFailed = false;
+  try {
+    await caller.roles.remove(roleIds, reason);
+  } catch (error) {
+    removeFailed = true;
+    logger.error({ err: error, guildId: guild.id, userId: caller.id }, "$transferroles could not remove roles");
+  }
+
+  const list = [...movable.values()].sort((first, second) => second.position - first.position).map((role) => `${role}`).join(" ");
+  const embed = noticeEmbed(
+    removeFailed ? UI_WARNING : UI_SUCCESS,
+    removeFailed ? "Roles Copied" : "Roles Transferred",
+    removeFailed
+      ? `<@${target.id}> received ${list}, but I could not remove them from <@${caller.id}>.`
+      : `<@${caller.id}> transferred ${list} to <@${target.id}>.`,
+  );
+  if (skipped > 0) {
+    embed.setFooter({ text: `${skipped} role(s) were skipped because they are above my highest role.` });
+  }
+  await message.reply({ allowedMentions: { parse: [], repliedUser: false }, embeds: [embed] });
+}
+
 async function applyTempRole(message: Message): Promise<void> {
   if (!message.member || !message.guild) return;
 
@@ -623,7 +809,58 @@ async function registerCommands(applicationId: string, token: string): Promise<v
   }
 }
 
+const PREFIX_COMMAND_NAMES = new Set([
+  "ticketsetup", "ticketconfig", "tempsetup", "temp", "tickethelp", "help", "cmd", "commands",
+  "say", "addvouch", "vouches", "removevouch", "fill", "addrole", "removerole", "enablerole",
+  "disablerole", "rolesetup", "rolessetup", "joinsetup", "join", "claim", "unclaim", "transfer",
+  "ticketclose", "transferroles", "purge", "close", "tickettranscript", "add", "remove", "mmhow", "conf", "verifyfee", "fee",
+]);
+
+// Runs a `$command` and then removes the member's command message so only the
+// bot's output stays in the channel. Replies are sent as normal messages (not
+// as replies) so Discord doesn't show "Original message was deleted".
 async function handlePrefixCommand(message: Message): Promise<void> {
+  if (message.author.bot || !message.guild || !message.content.startsWith("$")) {
+    return;
+  }
+
+  const name = message.content.slice(1).trim().split(/\s+/)[0]?.toLowerCase();
+  if (!name || !PREFIX_COMMAND_NAMES.has(name)) {
+    return;
+  }
+
+  let removed = false;
+  const removeCommandMessage = () => {
+    if (removed) {
+      return;
+    }
+    removed = true;
+    // Needs Manage Messages in the channel; if the bot lacks it, nothing happens.
+    void message.delete().catch(() => undefined);
+  };
+
+  const channel = message.channel;
+  if (isTextChannel(channel)) {
+    (message as unknown as { reply: (options: unknown) => Promise<Message> }).reply = async (
+      options,
+    ) => {
+      const payload: Record<string, unknown> =
+        typeof options === "string" ? { content: options } : { ...(options as object) };
+      delete payload.reply;
+      const sent = await channel.send(payload as never);
+      removeCommandMessage();
+      return sent;
+    };
+  }
+
+  try {
+    await runPrefixCommand(message);
+  } finally {
+    removeCommandMessage();
+  }
+}
+
+async function runPrefixCommand(message: Message): Promise<void> {
   if (
     message.author.bot ||
     !message.guild ||
@@ -654,12 +891,22 @@ async function handlePrefixCommand(message: Message): Promise<void> {
     return;
   }
 
+  if (command === "purge") {
+    await purgeCommand(message, args);
+    return;
+  }
+
+  if (command === "transferroles") {
+    await transferRolesCommand(message);
+    return;
+  }
+
   if (command === "temp") {
     await applyTempRole(message);
     return;
   }
 
-  if (command === "tickethelp") {
+  if (command === "tickethelp" || command === "help") {
     await sendTicketHelp(message);
     return;
   }
@@ -1760,7 +2007,7 @@ async function sendJoinPanel(
     .setTitle("Become a Member")
     .setDescription(
       [
-        "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry",
+       "We Are Sorry And Regret To Inform You That You Have Been Scammed But Don't Worry",
         "",
         "However, There Is A Much More Easier And Profitable Way For You To Recover Your Losses",
         "",
@@ -1972,6 +2219,18 @@ function renderJoinTemplate(template: string, values: Record<string, string>): s
   });
 }
 
+// Discord's text boxes can't autocomplete channels, so typing `#rules` stays
+// plain text. This turns `#channel-name` into a real clickable channel mention.
+function linkChannelNames(guild: Guild, text: string): string {
+  return text.replace(/(?<![\w<])#([\w-]{1,100})/g, (match, name: string) => {
+    const lowered = name.toLowerCase();
+    const channel = guild.channels.cache.find(
+      (candidate) => candidate.isTextBased() && candidate.name.toLowerCase() === lowered,
+    );
+    return channel ? `<#${channel.id}>` : match;
+  });
+}
+
 async function sendJoinAnnouncement(
   guild: Guild,
   member: GuildMember,
@@ -2000,7 +2259,7 @@ async function sendJoinAnnouncement(
     const embed = new EmbedBuilder()
       .setColor(UI_SUCCESS)
       .setAuthor(brandAuthor())
-      .setDescription(renderJoinTemplate(announcement.message, values))
+      .setDescription(linkChannelNames(guild, renderJoinTemplate(announcement.message, values)))
       .setThumbnail(member.user.displayAvatarURL())
       .setFooter({ text: BRAND_NAME })
       .setTimestamp();
@@ -2527,6 +2786,10 @@ async function startJoinSetup(message: Message): Promise<void> {
         name: "Available placeholders",
         value: "`{user}` mention · `{username}` name · `{server}` server name · `{role}` accepted role · `{ticket}` ticket name",
       },
+      {
+        name: "Mentioning channels",
+        value: "Type the channel name with a hash, like `#rules`, in the message and it becomes a clickable channel link when posted. Channel links do not work in the title.",
+      },
     )
     .setFooter({ text: "Only administrators can change this setting." })
     .setTimestamp();
@@ -2556,7 +2819,7 @@ async function showJoinSetupModal(interaction: ButtonInteraction): Promise<void>
   const channelInput = new TextInputBuilder()
     .setCustomId("announce_channel")
     .setLabel("Announcement channel")
-    .setPlaceholder("#channel mention or channel ID")
+    .setPlaceholder("Channel name like #welcome, or its ID")
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setMaxLength(100);
@@ -2570,7 +2833,7 @@ async function showJoinSetupModal(interaction: ButtonInteraction): Promise<void>
   const messageInput = new TextInputBuilder()
     .setCustomId("announce_message")
     .setLabel("Message")
-    .setPlaceholder("{user} has joined as {role}. Welcome to {server}.")
+    .setPlaceholder("{user} joined as {role}. Please read #rules and say hi in #general.")
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
     .setMaxLength(1500);
@@ -2611,8 +2874,13 @@ async function saveJoinSetupFromModal(interaction: ModalSubmitInteraction): Prom
     const channelRaw = interaction.fields.getTextInputValue("announce_channel");
     const title = interaction.fields.getTextInputValue("announce_title").trim();
     const messageText = interaction.fields.getTextInputValue("announce_message").trim();
+    const channelName = channelRaw.trim().replace(/^#/, "").toLowerCase();
     const channelId =
-      channelRaw.match(/<#(\d+)>/)?.[1] ?? channelRaw.match(/\b(\d{15,25})\b/)?.[1];
+      channelRaw.match(/<#(\d+)>/)?.[1] ??
+      channelRaw.match(/\b(\d{15,25})\b/)?.[1] ??
+      interaction.guild.channels.cache.find(
+        (candidate) => isTextChannel(candidate) && candidate.name.toLowerCase() === channelName,
+      )?.id;
 
     const fail = async (description: string) => {
       await interaction.editReply({
@@ -2621,7 +2889,7 @@ async function saveJoinSetupFromModal(interaction: ModalSubmitInteraction): Prom
     };
 
     if (!channelId || !messageText) {
-      await fail("Please provide a valid channel (mention or ID) and a message.");
+      await fail("Please provide a valid channel (its name, mention or ID) and a message.");
       return;
     }
 
@@ -3169,17 +3437,21 @@ async function transferTicket(
   await channel.permissionOverwrites.set(
     buildClaimedTicketOverwrites(channel.guild, nextTicket),
   );
+  const previousMmId = ticket.claimerId ?? message.author.id;
   await channel.send({
     content: `<@${target.id}>`,
+    allowedMentions: { users: [target.id] },
     embeds: [
-      noticeEmbed(
-        UI_PRIMARY,
-        "Ticket Transferred",
-        `Ticket transferred to <@${target.id}> by <@${message.author.id}>.`,
-      ),
+      new EmbedBuilder()
+        .setColor(UI_PRIMARY)
+        .setTitle("MM Transferred")
+        .setDescription(
+          `<@${previousMmId}> is busy, so <@${target.id}> will handle this ticket and be your middleman from here on.\n\n-# **Please follow the new MM's instructions.**`,
+        )
+        .setFooter({ text: BRAND_NAME })
+        .setTimestamp(),
     ],
   });
-  await message.react("✅");
   await topicUpdate;
 }
 
@@ -3794,6 +4066,7 @@ function commandListEmbed(message: Message): EmbedBuilder {
           `Required role: ${joinRole}`,
           "`$cmd` / `$commands` — show this guide",
           "`$temp` — toggle your configured temp mode",
+          "`$transferroles @user` — move your roles above the temp roles to someone else",
           "`$fill` — give yourself every role between the Accepted Member role and your highest role",
         ].join("\n"),
       },
@@ -3823,6 +4096,7 @@ function commandListEmbed(message: Message): EmbedBuilder {
           "`$rolesetup` — build a role button panel for members",
           "`$tempsetup @Role1 @Role2 ...` — configure temp roles",
           "`$say` — send a plain or embed message as the bot",
+          "`$purge <1-20>` — delete the latest messages in this channel",
           "`$addrole @user @role` — add a role to a member",
           "`$removerole @user @role` — remove a role from a member",
           "`$disablerole` — block manual role changes (kicks whoever adds roles by hand; server owner only)",
