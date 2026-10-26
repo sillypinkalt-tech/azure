@@ -127,6 +127,12 @@ type TicketConfig = {
   // Channel where role-guard alerts are posted (the channel $disablerole was run in).
   roleAlertChannelId?: string;
   rolePanel?: RolePanel;
+  // Role given automatically to every new (non-bot) member. Set with $autorole.
+  autoRoleId?: string;
+  // Channel where $ban / $kick / $unban / $addrole / $removerole are logged. Chosen during $autorole.
+  modLogChannelId?: string;
+  // Members with this role are exempt from the manual role / manual ban guards. Set with $bypass.
+  bypassRoleId?: string;
   updatedAt: string;
 };
 
@@ -215,6 +221,8 @@ async function connectDiscordBot(): Promise<void> {
   await loadTicketConfigs();
   await loadTicketStore();
   await loadVouchCounts();
+  await loadMessageCounts();
+  await loadInviterRecords();
   status.state = "starting";
   status.lastError = null;
   status.startedAt = new Date().toISOString();
@@ -226,6 +234,10 @@ async function connectDiscordBot(): Promise<void> {
       GatewayIntentBits.MessageContent,
       // Non-privileged intent that delivers audit log entries in real time.
       GatewayIntentBits.GuildModeration,
+      // Privileged intent (enable "Server Members Intent" in the Developer Portal): auto role + $whois.
+      GatewayIntentBits.GuildMembers,
+      // Lets the bot track which invite a member used.
+      GatewayIntentBits.GuildInvites,
     ],
   });
 
@@ -240,6 +252,9 @@ async function connectDiscordBot(): Promise<void> {
     );
 
     void registerCommands(readyClient.user.id, token);
+    for (const guild of readyClient.guilds.cache.values()) {
+      void cacheGuildInvites(guild);
+    }
     for (const guild of readyClient.guilds.cache.values()) {
       void migrateLegacyTicketTopics(guild);
     }
@@ -263,6 +278,10 @@ async function connectDiscordBot(): Promise<void> {
     }
 
     if (interaction.isChannelSelectMenu()) {
+      if (interaction.customId.startsWith("autorole:log:")) {
+        void handleLogChannelSelect(interaction);
+        return;
+      }
       void handleTranscriptChannelSelect(interaction);
       return;
     }
@@ -274,9 +293,23 @@ async function connectDiscordBot(): Promise<void> {
 
   nextClient.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
     void handleRoleAuditEntry(entry, guild);
+    void handleBanAuditEntry(entry, guild);
+  });
+
+  nextClient.on(Events.GuildMemberAdd, (member) => {
+    void handleMemberJoin(member);
+  });
+
+  nextClient.on(Events.InviteCreate, (invite) => {
+    handleInviteCreate(invite);
+  });
+
+  nextClient.on(Events.InviteDelete, (invite) => {
+    handleInviteDelete(invite);
   });
 
   nextClient.on(Events.MessageCreate, (message) => {
+    trackMessage(message);
     void handlePrefixCommand(message);
   });
 
@@ -814,6 +847,7 @@ const PREFIX_COMMAND_NAMES = new Set([
   "say", "addvouch", "vouches", "removevouch", "fill", "addrole", "removerole", "enablerole",
   "disablerole", "rolesetup", "rolessetup", "joinsetup", "join", "claim", "unclaim", "transfer",
   "ticketclose", "transferroles", "purge", "close", "tickettranscript", "add", "remove", "mmhow", "conf", "verifyfee", "fee",
+  "autorole", "bypass", "ban", "kick", "unban", "whois", "w",
 ]);
 
 // Runs a `$command` and then removes the member's command message so only the
@@ -893,6 +927,36 @@ async function runPrefixCommand(message: Message): Promise<void> {
 
   if (command === "purge") {
     await purgeCommand(message, args);
+    return;
+  }
+
+  if (command === "autorole") {
+    await autoRoleCommand(message, args);
+    return;
+  }
+
+  if (command === "bypass") {
+    await bypassCommand(message, args);
+    return;
+  }
+
+  if (command === "ban") {
+    await banCommand(message, args);
+    return;
+  }
+
+  if (command === "kick") {
+    await kickCommand(message, args);
+    return;
+  }
+
+  if (command === "unban") {
+    await unbanCommand(message, args);
+    return;
+  }
+
+  if (command === "whois" || command === "w") {
+    await whoisCommand(message, args);
     return;
   }
 
@@ -1690,6 +1754,13 @@ async function removeRoleCommand(message: Message): Promise<void> {
   try {
     await member.roles.remove(role, `$removerole used by ${message.author.tag}`);
     await reply(UI_DANGER, "Role Removed", `${role} was removed from <@${member.id}> by <@${message.author.id}>.`);
+    await logModAction(guild, {
+      action: "Role Removed",
+      color: UI_DANGER,
+      moderatorId: message.author.id,
+      targetId: member.id,
+      extra: [{ name: "Role", value: `${role}`, inline: true }],
+    });
   } catch (error) {
     logger.error({ err: error, guildId: guild.id, userId }, "$removerole failed");
     await reply(UI_DANGER, "Remove Role Failed", "I could not remove that role. Please check my permissions and role position.");
@@ -1760,6 +1831,13 @@ async function addRoleCommand(message: Message): Promise<void> {
   try {
     await member.roles.add(role, `$addrole used by ${message.author.tag}`);
     await reply(UI_SUCCESS, "Role Added", `${role} was added to <@${member.id}> by <@${message.author.id}>.`);
+    await logModAction(guild, {
+      action: "Role Added",
+      color: UI_SUCCESS,
+      moderatorId: message.author.id,
+      targetId: member.id,
+      extra: [{ name: "Role", value: `${role}`, inline: true }],
+    });
   } catch (error) {
     logger.error({ err: error, guildId: guild.id, userId }, "$addrole failed");
     await reply(UI_DANGER, "Add Role Failed", "I could not add that role. Please check my permissions and role position.");
@@ -1803,7 +1881,7 @@ async function setManualRolePolicy(message: Message, manualAllowed: boolean): Pr
   const embed = noticeEmbed(
     UI_DANGER,
     "Manual Role Changes Disabled",
-    "Roles must now be added with `$addrole`. If anyone adds a role manually, the role is removed again and the person who added it is kicked. Only the server owner and this bot are exempt. Alerts are posted in this channel.",
+    "Roles must now be added with `$addrole`. If anyone adds a role manually, the role is removed again and the person who added it is kicked. Only the server owner, members with the `$bypass` role, and this bot are exempt. Alerts are posted in this channel.",
   );
   if (missing.length > 0) {
     embed.addFields({
@@ -1868,6 +1946,12 @@ async function handleRoleAuditEntry(entry: GuildAuditLogsEntry, guild: Guild): P
 
     const executor = await guild.members.fetch(executorId).catch(() => null);
     if (!executor) {
+      return;
+    }
+
+    // Members holding the $bypass role may still add roles by hand.
+    const bypassRoleId = ticketConfigs.get(guild.id)?.bypassRoleId;
+    if (bypassRoleId && executor.roles.cache.has(bypassRoleId)) {
       return;
     }
 
@@ -4033,69 +4117,100 @@ function canUseCommandGuide(message: Message): boolean {
   return hasJoinRole(message.guild.id, message.member);
 }
 
+function commandTable(rows: Array<[string, string]>): string {
+  const header: [string, string] = ["COMMAND", "WHAT IT DOES"];
+  const all = [header, ...rows];
+  const width = Math.max(...all.map(([command]) => command.length));
+  const line = (command: string, description: string) => `${command.padEnd(width)}  ${description}`;
+  return [
+    "```",
+    line(header[0], header[1]),
+    line("-".repeat(width), "-".repeat(20)),
+    ...rows.map(([command, description]) => line(command, description)),
+    "```",
+  ].join("\n");
+}
+
 function commandListEmbed(message: Message): EmbedBuilder {
   const joinRoleId = message.guild ? ticketConfigs.get(message.guild.id)?.joinRoleId : undefined;
-  const joinRole = joinRoleId ? `<@&${joinRoleId}>` : "Accepted Member role not configured";
+  const joinRole = joinRoleId ? `<@&${joinRoleId}>` : "not configured";
 
   return new EmbedBuilder()
     .setColor(UI_PRIMARY)
     .setAuthor(brandAuthor())
     .setTitle("Command Guide")
-    .setDescription("Commands are grouped by permission. Individual commands still enforce their own ticket/staff/admin requirements.")
+    .setDescription(
+      `Accepted Member role: ${joinRole}\nCommands are grouped by who can use them. Each command still checks its own requirements.`,
+    )
     .addFields(
       {
         name: "Accepted Members",
-        value: [
-          `Required role: ${joinRole}`,
-          "`$cmd` / `$commands` — show this guide",
-          "`$temp` — toggle your configured temp mode",
-          "`$transferroles @user` — move your roles above the temp roles to someone else",
-          "`$fill` — give yourself every role between the Accepted Member role and your highest role",
-        ].join("\n"),
+        value: commandTable([
+          ["$cmd", "Show this guide"],
+          ["$temp", "Toggle temp mode"],
+          ["$transferroles @u", "Move roles to a user"],
+          ["$fill", "Fill roles in the gap"],
+        ]),
       },
       {
-        name: "Ticket Staff",
-        value: [
-          "`$claim` — claim a ticket",
-          "`$unclaim` — release a ticket",
-          "`$transfer @user` — transfer a ticket",
-          "`$add @user @user ...` — add one or more people to a ticket",
-          "`$remove @user @user ...` — remove one or more people from a ticket",
-          "`$close` / `$ticketclose` — close a ticket",
-          "`$tickettranscript` — save the transcript",
-          "`$mmhow` — post the middleman guide",
-          "`$conf` — post trade confirmation",
-          "`$fee` — post the fee panel",
-          "`$verifyfee @user <value>` — post the verification collateral notice (ticket claimer only)",
-          "`$join @user` — post the Member Accept / Decline panel for that user (ticket claimer role or admin)",
-        ].join("\n"),
+        name: "Tickets (staff)",
+        value: commandTable([
+          ["$claim", "Claim a ticket"],
+          ["$unclaim", "Release a ticket"],
+          ["$transfer @u", "Hand ticket over"],
+          ["$add @u ...", "Add people"],
+          ["$remove @u ...", "Remove people"],
+          ["$close", "Close + transcript"],
+          ["$tickettranscript", "Save transcript"],
+        ]),
       },
       {
-        name: "Administrators",
-        value: [
-          "`$ticketsetup` — configure claim + Accepted Member roles and publish the panel",
-          "`$ticketconfig` — update claim + Accepted Member roles",
-          "`$joinsetup` — configure the announcement posted when a member accepts `$join`",
-          "`$rolesetup` — build a role button panel for members",
-          "`$tempsetup @Role1 @Role2 ...` — configure temp roles",
-          "`$say` — send a plain or embed message as the bot",
-          "`$purge <1-20>` — delete the latest messages in this channel",
-          "`$addrole @user @role` — add a role to a member",
-          "`$removerole @user @role` — remove a role from a member",
-          "`$disablerole` — block manual role changes (kicks whoever adds roles by hand; server owner only)",
-          "`$enablerole` — allow manual role changes again (server owner only)",
-        ].join("\n"),
+        name: "Ticket Panels (staff)",
+        value: commandTable([
+          ["$mmhow", "Middleman guide"],
+          ["$conf", "Trade confirmation"],
+          ["$fee", "Fee panel"],
+          ["$verifyfee @u <v>", "Collateral notice"],
+          ["$join @u", "Accept / Decline"],
+        ]),
       },
       {
-        name: "Vouches",
-        value: [
-          "`$addvouch <amount> [@user]` — add vouches",
-          "`$vouches [@user]` — view vouches",
-          "`$removevouch [@user]` — reset vouches",
-        ].join("\n"),
+        name: "Moderation",
+        value: commandTable([
+          ["$ban <u> [reason]", "Ban a user"],
+          ["$kick <u> [reason]", "Kick a member"],
+          ["$unban <id>", "Unban a user"],
+          ["$whois / $w [u]", "Full user details"],
+          ["$addrole @u @r", "Add a role (admin)"],
+          ["$removerole @u @r", "Remove a role (admin)"],
+        ]),
+      },
+      {
+        name: "Vouches (staff)",
+        value: commandTable([
+          ["$addvouch <n> [u]", "Add vouches"],
+          ["$vouches [u]", "View vouches"],
+          ["$removevouch [u]", "Reset vouches"],
+        ]),
+      },
+      {
+        name: "Admin Setup",
+        value: commandTable([
+          ["$ticketsetup", "Roles + ticket panel"],
+          ["$ticketconfig", "Change ticket roles"],
+          ["$joinsetup", "Join announcement"],
+          ["$rolesetup", "Role button panel"],
+          ["$tempsetup @r ...", "Set temp roles"],
+          ["$autorole @r", "Auto role + log channel"],
+          ["$bypass @r", "Guard exception role"],
+          ["$say", "Send as the bot"],
+          ["$purge <1-20>", "Delete messages"],
+          ["$disablerole", "Owner: lock role changes"],
+          ["$enablerole", "Owner: unlock them"],
+        ]),
       },
     )
-    .setFooter({ text: `${BRAND_NAME} · Organized command guide` })
+    .setFooter({ text: `${BRAND_NAME} · $ban/$kick/$unban need the matching Discord permission or admin` })
     .setTimestamp();
 }
 
@@ -4597,6 +4712,766 @@ async function getTranscriptLogChannel(
 
   const channel = await guild.channels.fetch(channelId);
   return channel && isTextChannel(channel) ? channel : null;
+}
+
+// ---------------------------------------------------------------------------
+// Auto role, bypass role, moderation commands, logs, $whois, invite + message tracking
+// ---------------------------------------------------------------------------
+
+const MESSAGE_COUNT_PATH = join(process.cwd(), "data", "message-counts.json");
+const INVITER_STORE_PATH = join(process.cwd(), "data", "member-inviters.json");
+
+type InviterRecord = { inviterId: string | null; code: string | null; note?: string; at: string };
+const messageCounts = new Map<string, number>();
+const inviterRecords = new Map<string, InviterRecord>();
+const inviteUseCache = new Map<string, Map<string, { uses: number; inviterId: string | null }>>();
+const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleJsonSave(path: string, getData: () => unknown, delayMs = 15_000): void {
+  if (saveTimers.has(path)) {
+    return;
+  }
+  saveTimers.set(
+    path,
+    setTimeout(() => {
+      saveTimers.delete(path);
+      void (async () => {
+        try {
+          await mkdir(join(process.cwd(), "data"), { recursive: true });
+          await writeFile(path, JSON.stringify(getData(), null, 2));
+        } catch (error) {
+          logger.error({ err: error, path }, "Could not save data file");
+        }
+      })();
+    }, delayMs),
+  );
+}
+
+async function loadMessageCounts(): Promise<void> {
+  try {
+    const saved = JSON.parse(await readFile(MESSAGE_COUNT_PATH, "utf8")) as Record<string, number>;
+    for (const [key, value] of Object.entries(saved)) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        messageCounts.set(key, value);
+      }
+    }
+  } catch (error) {
+    if (!isFileNotFoundError(error)) {
+      logger.error({ err: error }, "Message counts could not be loaded");
+    }
+  }
+}
+
+async function loadInviterRecords(): Promise<void> {
+  try {
+    const saved = JSON.parse(await readFile(INVITER_STORE_PATH, "utf8")) as Record<string, InviterRecord>;
+    for (const [key, value] of Object.entries(saved)) {
+      if (value && typeof value === "object") {
+        inviterRecords.set(key, value);
+      }
+    }
+  } catch (error) {
+    if (!isFileNotFoundError(error)) {
+      logger.error({ err: error }, "Inviter records could not be loaded");
+    }
+  }
+}
+
+function trackMessage(message: Message): void {
+  if (!message.guild || message.author.bot) {
+    return;
+  }
+  const key = vouchKey(message.guild.id, message.author.id);
+  messageCounts.set(key, (messageCounts.get(key) ?? 0) + 1);
+  scheduleJsonSave(MESSAGE_COUNT_PATH, () => Object.fromEntries(messageCounts));
+}
+
+async function cacheGuildInvites(guild: Guild): Promise<void> {
+  try {
+    const invites = await guild.invites.fetch();
+    const next = new Map<string, { uses: number; inviterId: string | null }>();
+    for (const invite of invites.values()) {
+      next.set(invite.code, { uses: invite.uses ?? 0, inviterId: invite.inviterId ?? null });
+    }
+    inviteUseCache.set(guild.id, next);
+  } catch {
+    // The bot needs Manage Server to read invites; $whois then shows "Unknown".
+  }
+}
+
+function handleInviteCreate(invite: { code: string; uses: number | null; inviterId: string | null; guild?: { id: string } | null }): void {
+  const guildId = invite.guild?.id;
+  if (!guildId) {
+    return;
+  }
+  const cache = inviteUseCache.get(guildId) ?? new Map();
+  cache.set(invite.code, { uses: invite.uses ?? 0, inviterId: invite.inviterId ?? null });
+  inviteUseCache.set(guildId, cache);
+}
+
+function handleInviteDelete(invite: { code: string; guild?: { id: string } | null }): void {
+  const guildId = invite.guild?.id;
+  if (!guildId) {
+    return;
+  }
+  // Keep it briefly: a single-use invite is deleted at the moment someone joins with it.
+  setTimeout(() => inviteUseCache.get(guildId)?.delete(invite.code), 10_000);
+}
+
+async function recordInviter(member: GuildMember): Promise<void> {
+  const guild = member.guild;
+  const key = vouchKey(guild.id, member.id);
+  const at = new Date().toISOString();
+
+  if (member.user.bot) {
+    inviterRecords.set(key, { inviterId: null, code: null, note: "Bot (added through the OAuth2 flow)", at });
+    scheduleJsonSave(INVITER_STORE_PATH, () => Object.fromEntries(inviterRecords));
+    return;
+  }
+
+  const before = inviteUseCache.get(guild.id);
+  let after;
+  try {
+    after = await guild.invites.fetch();
+  } catch {
+    inviterRecords.set(key, { inviterId: null, code: null, note: "Unknown (I need Manage Server to track invites)", at });
+    scheduleJsonSave(INVITER_STORE_PATH, () => Object.fromEntries(inviterRecords));
+    return;
+  }
+
+  const next = new Map<string, { uses: number; inviterId: string | null }>();
+  for (const invite of after.values()) {
+    next.set(invite.code, { uses: invite.uses ?? 0, inviterId: invite.inviterId ?? null });
+  }
+
+  let used: { code: string; inviterId: string | null } | null = null;
+  if (before) {
+    for (const [code, info] of next) {
+      if (info.uses > (before.get(code)?.uses ?? 0)) {
+        used = { code, inviterId: info.inviterId };
+        break;
+      }
+    }
+    if (!used) {
+      // A single-use invite disappears once it has been used.
+      const gone = [...before.entries()].filter(([code]) => !next.has(code));
+      if (gone.length === 1) {
+        used = { code: gone[0][0], inviterId: gone[0][1].inviterId };
+      }
+    }
+  }
+  inviteUseCache.set(guild.id, next);
+
+  inviterRecords.set(
+    key,
+    used
+      ? { inviterId: used.inviterId, code: used.code, at }
+      : { inviterId: null, code: null, note: "Unknown (vanity URL or untracked invite)", at },
+  );
+  scheduleJsonSave(INVITER_STORE_PATH, () => Object.fromEntries(inviterRecords));
+}
+
+async function handleMemberJoin(member: GuildMember): Promise<void> {
+  const guild = member.guild;
+
+  const autoRoleId = ticketConfigs.get(guild.id)?.autoRoleId;
+  if (autoRoleId && !member.user.bot) {
+    const role = guild.roles.cache.get(autoRoleId);
+    if (role && !role.managed && role.editable) {
+      await member.roles.add(role, "Auto role").catch((error) => {
+        logger.error({ err: error, guildId: guild.id, userId: member.id }, "Auto role could not be given");
+      });
+    } else {
+      logger.warn({ guildId: guild.id, autoRoleId }, "Auto role is missing or above my highest role");
+    }
+  }
+
+  await recordInviter(member).catch((error) => {
+    logger.error({ err: error, guildId: guild.id }, "Invite tracking failed");
+  });
+}
+
+function noticeReplier(message: Message) {
+  return (color: number, title: string, description: string) =>
+    message.reply({
+      allowedMentions: { parse: [], repliedUser: false },
+      embeds: [noticeEmbed(color, title, description)],
+    });
+}
+
+function parseTargetId(token: string | undefined): string | undefined {
+  if (!token) {
+    return undefined;
+  }
+  return token.match(/^<@!?(\d{15,25})>$/)?.[1] ?? token.match(/^(\d{15,25})$/)?.[1];
+}
+
+// ---- $autorole / $bypass -------------------------------------------------
+
+async function autoRoleCommand(message: Message, args: string[]): Promise<void> {
+  if (!message.guild || !message.member || !isAdministrator(message.member)) {
+    return;
+  }
+  const guild = message.guild;
+  const reply = noticeReplier(message);
+
+  if (args[0]?.toLowerCase() === "off") {
+    await updateTicketConfig(guild.id, { autoRoleId: undefined });
+    await reply(UI_DANGER, "Auto Role Disabled", "New members will no longer receive an automatic role.");
+    return;
+  }
+
+  if (args.length > 0) {
+    await guild.roles.fetch();
+    const role = resolveRoleInput(guild, args.join(" "));
+    if (!role) {
+      await reply(UI_WARNING, "Auto Role", "That role could not be found. Use `$autorole @role`, a role ID, or `$autorole off`.");
+      return;
+    }
+    if (role.id === guild.roles.everyone.id || role.managed) {
+      await reply(UI_WARNING, "Auto Role", "Choose a regular server role, not @everyone or an integration-managed role.");
+      return;
+    }
+    if (!role.editable) {
+      await reply(UI_WARNING, "Auto Role", `I cannot manage ${role}. Move my highest role above it and try again.`);
+      return;
+    }
+    if (role.permissions.any(SELF_ASSIGN_BLOCKED_PERMISSIONS)) {
+      await reply(UI_WARNING, "Auto Role", `${role} has administrator or moderation permissions, so it cannot be handed to every new member.`);
+      return;
+    }
+    await updateTicketConfig(guild.id, { autoRoleId: role.id });
+  }
+
+  const config = ticketConfigs.get(guild.id);
+  const embed = new EmbedBuilder()
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle("Auto Role Setup")
+    .setDescription(
+      config?.autoRoleId
+        ? "Every new member will receive the role below."
+        : "No auto role is set yet. Run `$autorole @role` to choose one.",
+    )
+    .addFields(
+      { name: "Auto role", value: config?.autoRoleId ? `<@&${config.autoRoleId}>` : "Not set", inline: true },
+      { name: "Command log channel", value: config?.modLogChannelId ? `<#${config.modLogChannelId}>` : "Not set", inline: true },
+      {
+        name: "Next step",
+        value: "Pick the channel where `$ban`, `$kick`, `$unban`, `$addrole` and `$removerole` will be logged.",
+      },
+    )
+    .setFooter({ text: "Only administrators can change this setting." })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
+    new ChannelSelectMenuBuilder()
+      .setCustomId(`autorole:log:${message.author.id}`)
+      .setPlaceholder("Select a channel for command logs")
+      .addChannelTypes(ChannelType.GuildText)
+      .setMinValues(1)
+      .setMaxValues(1),
+  );
+  await message.reply({ embeds: [embed], components: [row], allowedMentions: { parse: [], repliedUser: false } });
+}
+
+async function handleLogChannelSelect(interaction: ChannelSelectMenuInteraction): Promise<void> {
+  try {
+    const adminId = interaction.customId.split(":")[2];
+    const guild = interaction.guild;
+    if (!guild || !adminId || interaction.user.id !== adminId || !isAdministrator(interaction.member)) {
+      return;
+    }
+    await interaction.deferUpdate();
+
+    const target = await guild.channels.fetch(interaction.values[0]).catch(() => null);
+    if (!target || !isTextChannel(target)) {
+      await interaction.editReply({
+        embeds: [noticeEmbed(UI_WARNING, "Command Log Channel", "That channel could not be found or is not a text channel.")],
+        components: [],
+      });
+      return;
+    }
+
+    const me = await guild.members.fetchMe().catch(() => null);
+    const canSend = me
+      ? target.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])
+      : false;
+    if (!canSend) {
+      await interaction.editReply({
+        embeds: [noticeEmbed(UI_WARNING, "Command Log Channel", `I need View Channel, Send Messages and Embed Links in ${target} first.`)],
+        components: [],
+      });
+      return;
+    }
+
+    const config = await updateTicketConfig(guild.id, { modLogChannelId: target.id });
+    await interaction.editReply({
+      embeds: [
+        noticeEmbed(UI_SUCCESS, "Auto Role Setup Complete", "Moderation command logs will now be posted in the channel below.").addFields(
+          { name: "Auto role", value: config.autoRoleId ? `<@&${config.autoRoleId}>` : "Not set", inline: true },
+          { name: "Command log channel", value: `${target}`, inline: true },
+        ),
+      ],
+      components: [],
+    });
+  } catch (error) {
+    logger.error({ err: error }, "Command log channel selection failed");
+  }
+}
+
+async function bypassCommand(message: Message, args: string[]): Promise<void> {
+  if (!message.guild || !message.member || !isAdministrator(message.member)) {
+    return;
+  }
+  const guild = message.guild;
+  const reply = noticeReplier(message);
+
+  if (args.length === 0) {
+    const current = ticketConfigs.get(guild.id)?.bypassRoleId;
+    await reply(
+      UI_PRIMARY,
+      "Bypass Role",
+      current
+        ? `Current bypass role: <@&${current}>. Members with it are exempt from the manual role and manual ban guards.\nUse \`$bypass @role\` to change it or \`$bypass off\` to remove it.`
+        : "No bypass role is set. Use `$bypass @role`.",
+    );
+    return;
+  }
+
+  if (args[0].toLowerCase() === "off") {
+    await updateTicketConfig(guild.id, { bypassRoleId: undefined });
+    await reply(UI_DANGER, "Bypass Role Removed", "Only the server owner and this bot are exempt from the guards now.");
+    return;
+  }
+
+  await guild.roles.fetch();
+  const role = resolveRoleInput(guild, args.join(" "));
+  if (!role || role.id === guild.roles.everyone.id) {
+    await reply(UI_WARNING, "Bypass Role", "Mention a valid role: `$bypass @role`.");
+    return;
+  }
+
+  await updateTicketConfig(guild.id, { bypassRoleId: role.id });
+  await reply(
+    UI_SUCCESS,
+    "Bypass Role Set",
+    `Members with ${role} may add roles by hand while \`$disablerole\` is on, and may ban manually without being kicked.`,
+  );
+}
+
+// ---- Moderation log ------------------------------------------------------
+
+type ModLogEntry = {
+  action: string;
+  color: number;
+  moderatorId: string;
+  targetId?: string;
+  reason?: string;
+  extra?: Array<{ name: string; value: string; inline?: boolean }>;
+};
+
+async function logModAction(guild: Guild, entry: ModLogEntry): Promise<void> {
+  const channelId = ticketConfigs.get(guild.id)?.modLogChannelId;
+  if (!channelId) {
+    return;
+  }
+  try {
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel || !isTextChannel(channel)) {
+      return;
+    }
+    const embed = new EmbedBuilder()
+      .setColor(entry.color)
+      .setAuthor(brandAuthor())
+      .setTitle(`Mod Log · ${entry.action}`)
+      .addFields({ name: "Moderator", value: `<@${entry.moderatorId}>`, inline: true })
+      .setTimestamp();
+    if (entry.targetId) {
+      embed.addFields({ name: "Target", value: `<@${entry.targetId}> (\`${entry.targetId}\`)`, inline: true });
+    }
+    if (entry.reason) {
+      embed.addFields({ name: "Reason", value: entry.reason.slice(0, 1000) });
+    }
+    if (entry.extra?.length) {
+      embed.addFields(entry.extra);
+    }
+    await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id }, "Mod log could not be posted");
+  }
+}
+
+// ---- $ban / $kick / $unban -----------------------------------------------
+
+function canUseModCommand(member: unknown, permission: bigint): boolean {
+  return isAdministrator(member) || hasPermission(member, permission);
+}
+
+function moderatorOutranks(message: Message, target: GuildMember): boolean {
+  if (!message.guild || !message.member) {
+    return false;
+  }
+  if (message.author.id === message.guild.ownerId) {
+    return true;
+  }
+  return message.member.roles.highest.position > target.roles.highest.position;
+}
+
+async function banCommand(message: Message, args: string[]): Promise<void> {
+  if (!message.guild || !message.member || !canUseModCommand(message.member, PermissionFlagsBits.BanMembers)) {
+    return;
+  }
+  const guild = message.guild;
+  const reply = noticeReplier(message);
+
+  const targetId = parseTargetId(args[0]);
+  if (!targetId) {
+    await reply(UI_WARNING, "Ban", "Use `$ban @user [reason]` or `$ban <user id> [reason]`.");
+    return;
+  }
+  const reason = args.slice(1).join(" ").trim() || "No reason provided";
+
+  if (targetId === message.author.id) {
+    await reply(UI_WARNING, "Ban", "You cannot ban yourself.");
+    return;
+  }
+  if (targetId === guild.ownerId || targetId === message.client.user?.id) {
+    await reply(UI_WARNING, "Ban", "I cannot ban the server owner or myself.");
+    return;
+  }
+
+  const member = await guild.members.fetch(targetId).catch(() => null);
+  if (member) {
+    if (!moderatorOutranks(message, member)) {
+      await reply(UI_WARNING, "Ban", "You cannot ban someone whose highest role is at or above yours.");
+      return;
+    }
+    if (!member.bannable) {
+      await reply(UI_WARNING, "Ban", "I cannot ban that member. Their highest role is at or above mine.");
+      return;
+    }
+  }
+  if (await guild.bans.fetch(targetId).catch(() => null)) {
+    await reply(UI_WARNING, "Ban", "That user is already banned.");
+    return;
+  }
+
+  const user = member?.user ?? (await message.client.users.fetch(targetId).catch(() => null));
+  if (!user) {
+    await reply(UI_WARNING, "Ban", "That user could not be found.");
+    return;
+  }
+
+  try {
+    await guild.bans.create(targetId, { reason: `${reason} | by ${message.author.tag}` });
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id, targetId }, "$ban failed");
+    await reply(UI_DANGER, "Ban Failed", "I could not ban that user. Please check my Ban Members permission and role position.");
+    return;
+  }
+
+  await reply(UI_DANGER, "Member Banned", `<@${targetId}> (${user.username}) was banned by <@${message.author.id}>.\n**Reason:** ${reason}`);
+  await logModAction(guild, { action: "Ban", color: UI_DANGER, moderatorId: message.author.id, targetId, reason });
+}
+
+async function kickCommand(message: Message, args: string[]): Promise<void> {
+  if (!message.guild || !message.member || !canUseModCommand(message.member, PermissionFlagsBits.KickMembers)) {
+    return;
+  }
+  const guild = message.guild;
+  const reply = noticeReplier(message);
+
+  const targetId = parseTargetId(args[0]);
+  if (!targetId) {
+    await reply(UI_WARNING, "Kick", "Use `$kick @user [reason]` or `$kick <user id> [reason]`.");
+    return;
+  }
+  const reason = args.slice(1).join(" ").trim() || "No reason provided";
+
+  if (targetId === message.author.id) {
+    await reply(UI_WARNING, "Kick", "You cannot kick yourself.");
+    return;
+  }
+  if (targetId === guild.ownerId || targetId === message.client.user?.id) {
+    await reply(UI_WARNING, "Kick", "I cannot kick the server owner or myself.");
+    return;
+  }
+
+  const member = await guild.members.fetch(targetId).catch(() => null);
+  if (!member) {
+    await reply(UI_WARNING, "Kick", "That member is not in this server.");
+    return;
+  }
+  if (!moderatorOutranks(message, member)) {
+    await reply(UI_WARNING, "Kick", "You cannot kick someone whose highest role is at or above yours.");
+    return;
+  }
+  if (!member.kickable) {
+    await reply(UI_WARNING, "Kick", "I cannot kick that member. Their highest role is at or above mine.");
+    return;
+  }
+
+  try {
+    await member.kick(`${reason} | by ${message.author.tag}`);
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id, targetId }, "$kick failed");
+    await reply(UI_DANGER, "Kick Failed", "I could not kick that member. Please check my Kick Members permission and role position.");
+    return;
+  }
+
+  await reply(UI_WARNING, "Member Kicked", `<@${targetId}> (${member.user.username}) was kicked by <@${message.author.id}>.\n**Reason:** ${reason}`);
+  await logModAction(guild, { action: "Kick", color: UI_WARNING, moderatorId: message.author.id, targetId, reason });
+}
+
+async function unbanCommand(message: Message, args: string[]): Promise<void> {
+  if (!message.guild || !message.member || !canUseModCommand(message.member, PermissionFlagsBits.BanMembers)) {
+    return;
+  }
+  const guild = message.guild;
+  const reply = noticeReplier(message);
+
+  const targetId = parseTargetId(args[0]);
+  if (!targetId) {
+    await reply(UI_WARNING, "Unban", "Use `$unban <user id> [reason]`.");
+    return;
+  }
+  const reason = args.slice(1).join(" ").trim() || "No reason provided";
+
+  if (!(await guild.bans.fetch(targetId).catch(() => null))) {
+    await reply(UI_WARNING, "Unban", "That user is not banned.");
+    return;
+  }
+
+  try {
+    await guild.bans.remove(targetId, `${reason} | by ${message.author.tag}`);
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id, targetId }, "$unban failed");
+    await reply(UI_DANGER, "Unban Failed", "I could not unban that user. Please check my Ban Members permission.");
+    return;
+  }
+
+  await reply(UI_SUCCESS, "Member Unbanned", `<@${targetId}> was unbanned by <@${message.author.id}>.\n**Reason:** ${reason}`);
+  await logModAction(guild, { action: "Unban", color: UI_SUCCESS, moderatorId: message.author.id, targetId, reason });
+}
+
+// ---- Manual ban guard ----------------------------------------------------
+
+async function handleBanAuditEntry(entry: GuildAuditLogsEntry, guild: Guild): Promise<void> {
+  try {
+    if (entry.action !== AuditLogEvent.MemberBanAdd) {
+      return;
+    }
+
+    // Bans made through $ban come from the bot itself, so they are never punished.
+    const executorId = entry.executorId;
+    const botId = guild.client.user?.id;
+    if (!executorId || executorId === botId || executorId === guild.ownerId) {
+      return;
+    }
+
+    const executor = await guild.members.fetch(executorId).catch(() => null);
+    if (!executor) {
+      return;
+    }
+    const bypassRoleId = ticketConfigs.get(guild.id)?.bypassRoleId;
+    if (bypassRoleId && executor.roles.cache.has(bypassRoleId)) {
+      return;
+    }
+
+    // Undo the manual ban, then remove the person who made it.
+    let unbanned = false;
+    if (entry.targetId) {
+      unbanned = await guild.bans
+        .remove(entry.targetId, "Manual ban reverted (use $ban)")
+        .then(() => true)
+        .catch(() => false);
+    }
+
+    let kicked = false;
+    let kickError = "";
+    const me = await guild.members.fetchMe().catch(() => null);
+    if (!me?.permissions.has(PermissionFlagsBits.KickMembers)) {
+      kickError = "I do not have the Kick Members permission.";
+    } else if (!executor.kickable) {
+      kickError = "Their highest role is at or above my highest role. Move my role above theirs.";
+    } else {
+      kicked = await executor
+        .kick("Banned a member manually (use $ban)")
+        .then(() => true)
+        .catch((error) => {
+          kickError = error instanceof Error ? error.message : "Unknown error";
+          return false;
+        });
+    }
+
+    const config = ticketConfigs.get(guild.id);
+    const logChannelId = config?.modLogChannelId;
+    const fetched = logChannelId ? await guild.channels.fetch(logChannelId).catch(() => null) : null;
+    const alertChannel = fetched && isTextChannel(fetched) ? fetched : await getRoleAlertChannel(guild);
+    if (alertChannel) {
+      const embed = noticeEmbed(
+        kicked ? UI_DANGER : UI_WARNING,
+        "Manual Ban Detected",
+        `<@${executorId}> banned ${entry.targetId ? `<@${entry.targetId}>` : "a member"} without using \`$ban\`.`,
+      ).addFields(
+        { name: "Ban reverted", value: unbanned ? "Yes" : "No", inline: true },
+        { name: "Banner kicked", value: kicked ? "Yes" : `No. ${kickError}`, inline: true },
+      );
+      await alertChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => undefined);
+    }
+    logger.warn({ guildId: guild.id, executorId, targetId: entry.targetId, unbanned, kicked, kickError }, "Manual ban handled");
+  } catch (error) {
+    logger.error({ err: error, guildId: guild.id }, "Ban audit entry handling failed");
+  }
+}
+
+// ---- $whois / $w ---------------------------------------------------------
+
+const WHOIS_PERMISSIONS: Array<[bigint, string]> = [
+  [PermissionFlagsBits.Administrator, "Administrator"],
+  [PermissionFlagsBits.ManageGuild, "Manage Server"],
+  [PermissionFlagsBits.ManageRoles, "Manage Roles"],
+  [PermissionFlagsBits.ManageChannels, "Manage Channels"],
+  [PermissionFlagsBits.BanMembers, "Ban Members"],
+  [PermissionFlagsBits.KickMembers, "Kick Members"],
+  [PermissionFlagsBits.ModerateMembers, "Timeout Members"],
+  [PermissionFlagsBits.ManageMessages, "Manage Messages"],
+  [PermissionFlagsBits.ManageNicknames, "Manage Nicknames"],
+  [PermissionFlagsBits.ManageWebhooks, "Manage Webhooks"],
+  [PermissionFlagsBits.ViewAuditLog, "View Audit Log"],
+  [PermissionFlagsBits.MentionEveryone, "Mention Everyone"],
+];
+
+function formatSpan(ms: number): string {
+  const totalDays = Math.max(0, Math.floor(ms / 86_400_000));
+  const years = Math.floor(totalDays / 365);
+  const months = Math.floor((totalDays % 365) / 30);
+  const days = (totalDays % 365) % 30;
+  const parts: string[] = [];
+  if (years > 0) parts.push(`${years} year${years === 1 ? "" : "s"}`);
+  if (months > 0) parts.push(`${months} month${months === 1 ? "" : "s"}`);
+  if (days > 0 || parts.length === 0) parts.push(`${days} day${days === 1 ? "" : "s"}`);
+  return parts.join(", ");
+}
+
+function describeInviter(guildId: string, userId: string): string {
+  const record = inviterRecords.get(vouchKey(guildId, userId));
+  if (!record) {
+    return "Unknown (joined before tracking started)";
+  }
+  if (record.inviterId) {
+    return `<@${record.inviterId}>${record.code ? ` · invite \`${record.code}\`` : ""}`;
+  }
+  return record.note ?? "Unknown";
+}
+
+async function whoisCommand(message: Message, args: string[]): Promise<void> {
+  if (!message.guild || !message.member) {
+    return;
+  }
+  const allowed =
+    canClaimTicket(message) ||
+    canUseModCommand(message.member, PermissionFlagsBits.KickMembers) ||
+    canUseModCommand(message.member, PermissionFlagsBits.BanMembers) ||
+    canUseModCommand(message.member, PermissionFlagsBits.ModerateMembers);
+  if (!allowed) {
+    return;
+  }
+
+  const guild = message.guild;
+  const reply = noticeReplier(message);
+  const targetId = args.length === 0 ? message.author.id : parseTargetId(args[0]);
+  if (!targetId) {
+    await reply(UI_WARNING, "Who Is", "Use `$whois @user` or `$whois <user id>`.");
+    return;
+  }
+
+  const user = await message.client.users.fetch(targetId).catch(() => null);
+  if (!user) {
+    await reply(UI_WARNING, "Who Is", "That user could not be found.");
+    return;
+  }
+  const member = await guild.members.fetch(targetId).catch(() => null);
+
+  const now = Date.now();
+  const createdTs = Math.floor(user.createdTimestamp / 1000);
+  const embed = new EmbedBuilder()
+    .setColor(UI_PRIMARY)
+    .setAuthor(brandAuthor())
+    .setTitle(`User Info · ${user.username}`)
+    .setThumbnail(member?.displayAvatarURL({ size: 256 }) ?? user.displayAvatarURL({ size: 256 }))
+    .setDescription(`<@${user.id}> · \`${user.id}\`${user.bot ? " · **BOT**" : ""}`)
+    .addFields({
+      name: "Account Created",
+      value: `<t:${createdTs}:F>\n<t:${createdTs}:R> · account is **${formatSpan(now - user.createdTimestamp)}** old`,
+    });
+
+  if (!member) {
+    const ban = await guild.bans.fetch(targetId).catch(() => null);
+    embed.addFields(
+      { name: "Server Status", value: ban ? `Banned${ban.reason ? `: ${ban.reason.slice(0, 200)}` : ""}` : "Not in this server", inline: true },
+      { name: "Invited By", value: describeInviter(guild.id, targetId), inline: true },
+      { name: "Messages Sent", value: `${messageCounts.get(vouchKey(guild.id, targetId)) ?? 0}`, inline: true },
+    );
+    embed.setFooter({ text: `${BRAND_NAME} · Message counts start from when tracking began` }).setTimestamp();
+    await message.reply({ embeds: [embed], allowedMentions: { parse: [], repliedUser: false } });
+    return;
+  }
+
+  if (member.joinedTimestamp) {
+    const joinedTs = Math.floor(member.joinedTimestamp / 1000);
+    embed.addFields({
+      name: "Joined Server",
+      value: `<t:${joinedTs}:F>\n<t:${joinedTs}:R> · in server for **${formatSpan(now - member.joinedTimestamp)}**`,
+    });
+  }
+
+  const roles = member.roles.cache
+    .filter((role) => role.id !== guild.id)
+    .sort((first, second) => second.position - first.position);
+  let roleText = roles.size > 0 ? [...roles.values()].map((role) => `${role}`).join(" ") : "None";
+  if (roleText.length > 1000) {
+    roleText = `${roleText.slice(0, roleText.lastIndexOf(" ", 1000))} …`;
+  }
+
+  const isOwner = member.id === guild.ownerId;
+  let permissionText: string;
+  if (isOwner) {
+    permissionText = "**Server Owner** · has every permission";
+  } else if (member.permissions.has(PermissionFlagsBits.Administrator)) {
+    permissionText = "**Administrator** · has every permission";
+  } else {
+    const held = WHOIS_PERMISSIONS.filter(([bit]) => member.permissions.has(bit)).map(([, label]) => label);
+    permissionText = held.length > 0 ? held.join(", ") : "No key permissions";
+  }
+
+  const flags: string[] = [];
+  if (isOwner) flags.push("Server Owner");
+  if (member.premiumSince) flags.push(`Boosting since <t:${Math.floor(member.premiumSince.getTime() / 1000)}:D>`);
+  if (member.communicationDisabledUntil && member.communicationDisabledUntil.getTime() > now) {
+    flags.push(`Timed out until <t:${Math.floor(member.communicationDisabledUntil.getTime() / 1000)}:R>`);
+  }
+  if (member.pending) flags.push("Pending membership screening");
+  const bypassRoleId = ticketConfigs.get(guild.id)?.bypassRoleId;
+  if (bypassRoleId && member.roles.cache.has(bypassRoleId)) flags.push("Has bypass role");
+
+  embed.addFields(
+    { name: "Invited By", value: describeInviter(guild.id, member.id), inline: true },
+    { name: "Messages Sent", value: `${messageCounts.get(vouchKey(guild.id, member.id)) ?? 0}`, inline: true },
+    { name: "Vouches", value: `${getVouchCount(guild.id, member.id)}`, inline: true },
+    { name: "Nickname", value: member.nickname ?? "None", inline: true },
+    { name: "Highest Role", value: member.roles.highest.id === guild.id ? "None" : `${member.roles.highest}`, inline: true },
+    { name: "Role Count", value: `${roles.size}`, inline: true },
+    { name: `Roles [${roles.size}]`, value: roleText },
+    { name: "Key Permissions", value: permissionText.slice(0, 1000) },
+  );
+  if (flags.length > 0) {
+    embed.addFields({ name: "Status", value: flags.join("\n").slice(0, 1000) });
+  }
+  embed.setFooter({ text: `${BRAND_NAME} · Message counts start from when tracking began` }).setTimestamp();
+
+  await message.reply({ embeds: [embed], allowedMentions: { parse: [], repliedUser: false } });
 }
 
 function slugify(value: string): string {
